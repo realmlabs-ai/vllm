@@ -103,6 +103,9 @@ class _RequestCaptureState:
     # activation-store write-through. ``None`` disables it for this request.
     block_hashes: list[bytes] | None = None
     hash_block_size: int = 0
+    # True iff every consumer captures only prompt positions, so the request's
+    # capture is data-complete at end of prefill (enables early finalize).
+    prompt_bounded: bool = False
     steps_seen: int = 0
     error: str | None = None
     sidecar_fields: dict[str, Any] = field(default_factory=dict)
@@ -249,6 +252,26 @@ def _classify_positions(
     return positions, None
 
 
+def _is_prompt_bounded(
+    kind: str,
+    static: list[int] | None,
+    num_prompt_tokens: int,
+) -> bool:
+    """True if a consumer's positions are fully captured by end of prefill.
+
+    ``last_prompt`` / ``all_prompt`` and an explicit list confined to the
+    prompt range all complete once the prompt is forwarded. ``all`` /
+    ``all_generated`` (and explicit positions reaching into the generated
+    range) stay open until the request finishes, so they are *not* bounded
+    and cannot be early-finalized.
+    """
+    if kind in ("last_prompt", "all_prompt"):
+        return True
+    if kind == "explicit":
+        return static is not None and all(0 <= p < num_prompt_tokens for p in static)
+    return False
+
+
 def _filter_specs_to_layer_range(
     specs: dict[int, CaptureSpec],
     start: int,
@@ -320,6 +343,24 @@ class CaptureManager:
             )
         self._consumers = consumers
         self._consumer_specs = consumer_specs
+        # Device-resident dispatch (Solution B `ingpu_worker`, Option C): a
+        # consumer that advertises ``wants_device_tensors is True`` receives the
+        # on-device ``scratch_gpu`` rows directly from
+        # :meth:`dispatch_step_captures` — synchronously, with no D2H copy and no
+        # trip through the async dispatch thread — so activations it scores (e.g.
+        # an SAE) never leave the GPU. ``_device_mask`` / ``_host_mask`` are
+        # consumer-index bitsets partitioning the sinks; a step whose rows are
+        # wanted *only* by device consumers skips the entire pinned-host / event /
+        # packet path. The ``is True`` guard is deliberate: ``MagicMock`` sinks in
+        # tests auto-create truthy attributes, so only a real boolean ``True``
+        # opts a consumer into the device path.
+        self._device_mask = 0
+        self._host_mask = 0
+        for idx, sink in enumerate(consumers):
+            if getattr(sink, "wants_device_tensors", False) is True:
+                self._device_mask |= 1 << idx
+            else:
+                self._host_mask |= 1 << idx
         # ``num_hidden_layers`` is the GLOBAL layer count (across all
         # pipeline stages); client/global specs reference global layer
         # indices and are validated against it.
@@ -355,6 +396,10 @@ class CaptureManager:
         self._device = torch.device(device) if isinstance(device, str) else device
         self._finalize_timeout = finalize_timeout_s
         self._requests: dict[str, _RequestCaptureState] = {}
+        # Requests whose prompt-bounded capture became data-complete this step;
+        # drained by the runner via ``take_prompt_complete_requests`` to finalize
+        # them early (while still alive) rather than waiting for request finish.
+        self._prompt_complete: set[str] = set()
 
         # ---- Global-spec persistent buffers (CUDA-graph-safe path) ----
         #
@@ -618,6 +663,15 @@ class CaptureManager:
             position_kind[consumer_idx] = kind
             static_positions[consumer_idx] = static
 
+        # Prompt-bounded iff every consumer captures only prompt positions —
+        # then the request can be finalized at end of prefill (early finalize).
+        prompt_bounded = bool(merged) and all(
+            _is_prompt_bounded(
+                position_kind[idx], static_positions[idx], num_prompt_tokens
+            )
+            for idx in merged
+        )
+
         state = _RequestCaptureState(
             req_id=req_id,
             consumer_specs=merged,
@@ -626,6 +680,7 @@ class CaptureManager:
             num_prompt_tokens=num_prompt_tokens,
             block_hashes=block_hashes,
             hash_block_size=hash_block_size,
+            prompt_bounded=prompt_bounded,
             sidecar_fields=dict(sidecar_fields) if sidecar_fields else {},
         )
         self._requests[req_id] = state
@@ -633,6 +688,24 @@ class CaptureManager:
     def unregister_request(self, req_id: str) -> None:
         """Remove all state for ``req_id``.  Silent no-op if unknown."""
         self._requests.pop(req_id, None)
+        self._prompt_complete.discard(req_id)
+
+    def take_prompt_complete_requests(self) -> list[str]:
+        """Return prompt-bounded requests whose capture is now data-complete.
+
+        A request whose every consumer captures only prompt positions has all
+        its rows once the prompt is forwarded — well before it finishes. The
+        runner finalizes these immediately so their results are produced while
+        the request is still alive, removing the dependence on the post-finish
+        finalize step (which never runs for a drained/last request). Filtered to
+        still-registered requests and cleared each call; ``build_step_plan``
+        re-flags any that remain.
+        """
+        if not self._prompt_complete:
+            return []
+        ready = [r for r in self._prompt_complete if r in self._requests]
+        self._prompt_complete.clear()
+        return ready
 
     # ------------------------------------------------------- plan building
 
@@ -685,6 +758,13 @@ class CaptureManager:
             token_offset = batch_view.token_offsets[i]
             step_start = num_computed
             step_end = num_computed + num_scheduled
+
+            # Once the prompt has been fully forwarded, a prompt-bounded
+            # request has all the rows it will ever capture — flag it for the
+            # runner to finalize early (it is still alive and scheduled, so its
+            # result is produced without waiting for the post-finish step).
+            if state.prompt_bounded and step_end >= state.num_prompt_tokens:
+                self._prompt_complete.add(req_id)
 
             # Collect the union of (hook, layers, positions) across all
             # consumers for this request, tracking which consumer wants
@@ -940,6 +1020,21 @@ class CaptureManager:
         self._materialize_global_keys(plan)
 
         if not plan.entries:
+            return
+
+        # Device-resident fan-out (Option C): hand the on-device ``scratch_gpu``
+        # rows straight to device consumers, synchronously on this (step) thread
+        # while the scratch tensors are still alive. ``submit_chunk`` only stashes
+        # references here; the heavy compute (e.g. SAE encode) happens later in
+        # the consumer's finalize, off the step critical path.
+        if self._device_mask:
+            self._fan_out_device_resident(plan)
+
+        # If no host consumer wants any of this step's rows, every consumer was
+        # served on-device above — skip the D2H / pinned-host / cuda.Event /
+        # packet machinery entirely. This is the efficiency win: a GPU-only
+        # capture step never touches host memory.
+        if not any(e.consumer_mask & self._host_mask for e in plan.entries):
             return
 
         scratch_pinned: dict[
@@ -1343,80 +1438,115 @@ class CaptureManager:
             _pinned, view = pinned_view
             store.put(key, view[entry.scratch_row].clone())
 
-    def _fan_out_to_consumers(self, packet: _DispatchPacket) -> None:
-        """Walk consumers and submit chunks for ``packet`` (dispatch thread).
+    def _build_chunks_for_consumer(
+        self,
+        consumer_idx: int,
+        entries: list[CapturePositionEntry],
+        source: dict[tuple[int, str], torch.Tensor],
+    ) -> tuple[list[CaptureChunk], set[str]]:
+        """Group one consumer's ``entries`` and build its ``CaptureChunk``s.
 
-        Same per-(consumer × request × layer × hook) shape the inline
-        path used to have, but reading from the packet's pinned host
-        views instead of touching GPU memory.  Each consumer's submit
-        loop is isolated by try/except so one failing sink doesn't
-        block delivery to the others.
+        ``source`` maps ``(layer, hook)`` to the tensor to gather rows from —
+        a pinned host view (host path) or the on-device ``scratch_gpu`` tensor
+        (device-resident path). The row-index tensor is placed on the source's
+        device so ``index_select`` stays a device-local op for CUDA scratch.
+
+        Returns ``(chunks, request_ids)`` where ``request_ids`` is the set of
+        requests touched, used by callers for error attribution.
+        """
+        bit = 1 << consumer_idx
+        grouped: dict[tuple[str, int, str], list[CapturePositionEntry]] = defaultdict(
+            list
+        )
+        for entry in entries:
+            if entry.consumer_mask & bit:
+                grouped[(entry.request_id, entry.layer, entry.hook)].append(entry)
+
+        chunks: list[CaptureChunk] = []
+        for (req_id, layer, hook), chunk_entries in grouped.items():
+            src = source.get((layer, hook))
+            if src is None:
+                continue
+            row_indices = [e.scratch_row for e in chunk_entries]
+            idx_tensor = torch.tensor(row_indices, dtype=torch.long)
+            if src.is_cuda:
+                idx_tensor = idx_tensor.to(src.device)
+            chunk_tensor = src.index_select(0, idx_tensor)
+            chunks.append(
+                CaptureChunk(
+                    key=(VllmInternalRequestId(req_id), layer, hook),
+                    tensor=chunk_tensor,
+                    dtype=chunk_tensor.dtype,
+                    row_offset=0,
+                    step_index=chunk_entries[0].step_index,
+                    metadata={
+                        "consumer_index": consumer_idx,
+                        "positions": [e.logical_pos for e in chunk_entries],
+                        # Per-row logical shape so consumers can reshape the
+                        # flat ``(rows, width)`` tensor back to e.g.
+                        # ``(rows, hc_mult, hidden)`` for mHC hooks.
+                        "row_shape": self._schema_for(hook).logical_shape,
+                    },
+                )
+            )
+        return chunks, {k[0] for k in grouped}
+
+    @staticmethod
+    def _submit_chunks(sink: CaptureSink, chunks: list[CaptureChunk]) -> None:
+        """Hand ``chunks`` to ``sink``, preferring its batch entry point."""
+        if not chunks:
+            return
+        batch_submit = getattr(sink, "submit_chunk_batch", None)
+        if batch_submit is not None:
+            batch_submit(chunks)
+        else:
+            for chunk in chunks:
+                sink.submit_chunk(chunk)
+
+    def _fan_out_device_resident(self, plan: StepCapturePlan) -> None:
+        """Deliver on-device ``scratch_gpu`` rows to device-resident consumers.
+
+        Runs synchronously on the step thread (inside
+        :meth:`dispatch_step_captures`) while the scratch tensors are still
+        live, with no D2H copy. ``submit_chunk`` only stashes references, so
+        this is cheap; the consumer does its compute at finalize. Per-consumer
+        isolation mirrors :meth:`_fan_out_to_consumers`.
         """
         for consumer_idx, sink in enumerate(self._consumers):
-            bit = 1 << consumer_idx
-
-            grouped: dict[tuple[str, int, str], list[CapturePositionEntry]] = (
-                defaultdict(list)
-            )
-            for entry in packet.entries:
-                if entry.consumer_mask & bit:
-                    grouped_key = (entry.request_id, entry.layer, entry.hook)
-                    grouped[grouped_key].append(entry)
-
-            if not grouped:
+            if not (self._device_mask >> consumer_idx) & 1:
                 continue
-
             try:
-                # Build every chunk for this consumer's slice of the step,
-                # then hand them over in one batch call. Batching lets sinks
-                # amortize per-chunk overhead (locking, write-task creation,
-                # payload concatenation) across the whole step instead of
-                # paying it per (layer, hook) — the dominant cost when a
-                # request captures many layers per step.
-                chunks: list[CaptureChunk] = []
-                for (req_id, layer, hook), chunk_entries in grouped.items():
-                    scratch_key = (layer, hook)
-                    if scratch_key not in packet.scratch_pinned:
-                        continue
-                    _pinned, view = packet.scratch_pinned[scratch_key]
+                chunks, _req_ids = self._build_chunks_for_consumer(
+                    consumer_idx, plan.entries, plan.scratch_gpu
+                )
+                self._submit_chunks(sink, chunks)
+            except Exception:
+                logger.exception(
+                    "Device-resident consumer %d raised during dispatch; "
+                    "other consumers are unaffected.",
+                    consumer_idx,
+                )
 
-                    row_indices = [e.scratch_row for e in chunk_entries]
-                    idx_tensor = torch.tensor(row_indices, dtype=torch.long)
-                    chunk_tensor = view.index_select(0, idx_tensor)
+    def _fan_out_to_consumers(self, packet: _DispatchPacket) -> None:
+        """Walk *host* consumers and submit chunks for ``packet``.
 
-                    step_index = chunk_entries[0].step_index
-                    capture_key = (
-                        VllmInternalRequestId(req_id),
-                        layer,
-                        hook,
-                    )
-                    chunks.append(
-                        CaptureChunk(
-                            key=capture_key,
-                            tensor=chunk_tensor,
-                            dtype=chunk_tensor.dtype,
-                            row_offset=0,
-                            step_index=step_index,
-                            metadata={
-                                "consumer_index": consumer_idx,
-                                "positions": [e.logical_pos for e in chunk_entries],
-                                # Per-row logical shape so consumers can
-                                # reshape the flat ``(rows, width)`` tensor
-                                # back to e.g. ``(rows, hc_mult, hidden)``
-                                # for mHC hooks. ``(width,)`` for standard
-                                # residual hooks.
-                                "row_shape": self._schema_for(hook).logical_shape,
-                            },
-                        )
-                    )
-
-                if chunks:
-                    batch_submit = getattr(sink, "submit_chunk_batch", None)
-                    if batch_submit is not None:
-                        batch_submit(chunks)
-                    else:
-                        for chunk in chunks:
-                            sink.submit_chunk(chunk)
+        Runs on the dispatch thread, reading from the packet's pinned host
+        views (the rows are now CPU-resident). Device-resident consumers are
+        skipped here — they were served synchronously, on-device, from
+        :meth:`_fan_out_device_resident`. Each consumer's submit loop is
+        isolated by try/except so one failing sink doesn't block the others.
+        """
+        # Pre-extract the host view per ``(layer, hook)`` so the shared
+        # chunk-builder sees a uniform ``(layer, hook) -> tensor`` source.
+        source = {key: view for key, (_pinned, view) in packet.scratch_pinned.items()}
+        for consumer_idx, sink in enumerate(self._consumers):
+            if not (self._host_mask >> consumer_idx) & 1:
+                continue
+            try:
+                chunks, req_ids = self._build_chunks_for_consumer(
+                    consumer_idx, packet.entries, source
+                )
+                self._submit_chunks(sink, chunks)
             except Exception:
                 logger.exception(
                     "Consumer %d raised during dispatch; "
@@ -1428,7 +1558,7 @@ class CaptureManager:
                 # the dispatch thread here; in-place ``error`` assignment
                 # is safe under the GIL given the simple read-modify-write
                 # pattern, and we only set the field if it's still ``None``.
-                for req_id_key in {k[0] for k in grouped}:
+                for req_id_key in req_ids:
                     s = self._requests.get(req_id_key)
                     if s is not None and s.error is None:
                         s.error = f"consumer {consumer_idx} dispatch failed"

@@ -55,6 +55,13 @@ class CaptureConsumer(ABC):
       opt-in via ``SamplingParams.capture[consumer_name]``. Default
       ``False`` — most consumers have a global spec set at
       registration time.
+    - ``wants_device_tensors``: when ``True``, the manager delivers the
+      captured rows to this consumer *on the model device* (no D2H
+      copy), synchronously after the forward, so ``on_capture`` runs
+      the consumer's compute (e.g. an SAE encode) on the GPU. Default
+      ``False`` — consumers receive host (CPU) tensors. A step whose
+      rows are wanted only by device consumers skips the host dispatch
+      path entirely.
 
     Override points, in order of necessity:
 
@@ -76,6 +83,7 @@ class CaptureConsumer(ABC):
     location: Literal["worker", "driver"] = "worker"
     required_sidecar_fields: ClassVar[frozenset[str]] = frozenset()
     reads_client_spec: ClassVar[bool] = False
+    wants_device_tensors: ClassVar[bool] = False
 
     def __init__(  # noqa: B027 — intentional no-op default.
         self,
@@ -103,12 +111,21 @@ class CaptureConsumer(ABC):
         key: CaptureKey,
         tensor: torch.Tensor,
         sidecar: dict[str, Any],
-    ) -> None:
+    ) -> Any:
         """Called once per finalized capture key.
 
         ``tensor`` has shape ``(num_rows, hidden_size)`` in the dtype
-        captured. ``sidecar`` is filtered to the consumer's
+        captured. It is a host (CPU) tensor unless the consumer sets
+        ``wants_device_tensors = True``, in which case it is on the model
+        device. ``sidecar`` is filtered to the consumer's
         ``required_sidecar_fields`` plus ``vllm_internal_request_id``.
+
+        Any value returned becomes ``CaptureResult.payload`` for this key,
+        surfaced to the caller on
+        ``RequestOutput.capture_results[consumer_name].payload``. It must be
+        serializable across the engine→driver boundary (msgspec) — plain
+        Python scalars/lists/dicts/bytes, not raw tensors. Returning ``None``
+        (the default) leaves the payload empty.
         """
 
     def on_error(  # noqa: B027 — intentional no-op default.
@@ -141,6 +158,11 @@ class _BatchedAdapter:
     def __init__(self, consumer: CaptureConsumer) -> None:
         self._consumer = consumer
         self.location: Literal["worker", "driver"] = consumer.location
+        # Surface the consumer's device-residency preference on the sink so
+        # the manager can route this adapter through the on-device fan-out.
+        self.wants_device_tensors: bool = (
+            getattr(consumer, "wants_device_tensors", False) is True
+        )
         self._lock = threading.Lock()
         self._pending: dict[CaptureKey, list[tuple[int, torch.Tensor]]] = {}
         self._results: dict[CaptureKey, CaptureResult] = {}
@@ -167,7 +189,7 @@ class _BatchedAdapter:
             tensor = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
 
         try:
-            self._consumer.on_capture(key, tensor, finalize.sidecar)
+            payload = self._consumer.on_capture(key, tensor, finalize.sidecar)
         except Exception as exc:  # noqa: BLE001 — consumer isolation.
             error = f"{type(exc).__name__}: {exc}"
             with self._lock:
@@ -179,7 +201,7 @@ class _BatchedAdapter:
             return
 
         with self._lock:
-            self._results[key] = CaptureResult(key=key, status="ok")
+            self._results[key] = CaptureResult(key=key, status="ok", payload=payload)
 
     def get_result(self, key: CaptureKey) -> CaptureResult | None:
         with self._lock:

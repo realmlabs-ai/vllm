@@ -35,6 +35,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.model_executor.layers.attention import (
     Attention,
     EncoderOnlyAttention,
@@ -264,6 +265,9 @@ class LlamaDecoderLayer(nn.Module):
         cache_config = vllm_config.cache_config
         quant_config = self.get_quant_config(vllm_config)
 
+        # Global layer index, for activation-capture taps (see ``forward``).
+        self.layer_idx = extract_layer_index(prefix)
+
         self.hidden_size = config.hidden_size
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # Support abacusai/Smaug-72B-v0.1 with attention_bias
@@ -319,17 +323,27 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Activation-capture taps (Solution B). Called unconditionally: the
+        # custom op self-gates on the active capture manager and torch.compile
+        # constant-folds it away when nothing is capturing. Llama uses vLLM's
+        # fused add-norm residual pattern, so after each fused norm the returned
+        # ``residual`` IS the running residual stream; ``post_mlp`` materializes
+        # the next-layer add (``hidden_states + residual``). Mirrors qwen3_5.py.
         # Self Attention
         if residual is None:
+            maybe_capture_residual(hidden_states, self.layer_idx, "pre_attn")
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            maybe_capture_residual(residual, self.layer_idx, "pre_attn")
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        maybe_capture_residual(residual, self.layer_idx, "post_attn")
         hidden_states = self.mlp(hidden_states)
+        maybe_capture_residual(hidden_states + residual, self.layer_idx, "post_mlp")
         return hidden_states, residual
 
     def get_quant_config(self, vllm_config: VllmConfig) -> QuantizationConfig | None:

@@ -1860,12 +1860,20 @@ class GPUModelRunner(
         consumer errors are isolated so a failing sink never stops
         delivery to the others.
         """
-        if self._capture_manager is None:
+        mgr = self._capture_manager
+        if mgr is None:
             return
-        plan = self._capture_manager.consume_step_plan()
-        if plan is None:
-            return
-        self._capture_manager.dispatch_step_captures(plan)
+        plan = mgr.consume_step_plan()
+        if plan is not None:
+            mgr.dispatch_step_captures(plan)
+        # Early finalize: a request whose every consumer captures only prompt
+        # positions is data-complete at end of prefill. Finalizing it now (while
+        # it is still alive and scheduled) produces its result without depending
+        # on the post-finish finalize step — which never runs for a drained/last
+        # request. The post-finish path (``_update_states``) stays as a fallback;
+        # re-finalizing an already-finalized request is a no-op.
+        for req_id in mgr.take_prompt_complete_requests():
+            self._finalize_capture_for_request_async(req_id)
 
     def _build_capture_batch_view(self, scheduler_output: "SchedulerOutput"):
         """Project ``input_batch`` into a :class:`CaptureBatchView`."""
