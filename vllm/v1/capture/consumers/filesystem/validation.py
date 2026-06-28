@@ -59,14 +59,12 @@ if TYPE_CHECKING:
 # steering grows a new hook point, this tuple must be updated in
 # lockstep.
 #
-# ``mlp_in`` / ``mlp_out`` are reserved in the hook-id table
-# (``activation_capture.py``) and ``HookName`` but are not yet wired into
-# any model forward, so a request for them would pass validation and then
-# produce an empty, zero-byte capture. Keep them out of the accepted set
-# so admission rejects them until they are wired; re-add here once
-# implemented.
+# ``mlp_in`` / ``mlp_out`` are the MLP-sublayer taps for transcoder training,
+# wired on gemma3, gemma4, and the qwen3 family. They are valid to request;
+# on a model that does not wire them the tap simply never fires (no data),
+# the same as requesting a layer a model does not have.
 _VALID_HOOK_NAMES: frozenset[str] = frozenset(
-    ("pre_attn", "post_attn", "post_block")
+    ("pre_attn", "post_attn", "post_block", "mlp_in", "mlp_out")
 )
 
 _VALID_POSITION_KINDS: frozenset[str] = frozenset(

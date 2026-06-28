@@ -93,7 +93,7 @@ def _parse_params(params: dict[str, Any]) -> FilesystemConsumerParams:
 # imported) to keep ``_parse_params`` torch/pydantic-free. Keep this set in
 # sync with ``_VALID_HOOK_NAMES`` -- they must list the same hook points.
 _VALID_GLOBAL_HOOK_NAMES: frozenset[str] = frozenset(
-    ("pre_attn", "post_attn", "post_block")
+    ("pre_attn", "post_attn", "post_block", "mlp_in", "mlp_out")
 )
 
 

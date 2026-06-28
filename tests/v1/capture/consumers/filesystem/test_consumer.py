@@ -745,6 +745,12 @@ class TestGlobalCaptureSpec:
         with pytest.raises(ValueError, match="not a valid hook point"):
             _make_consumer(tmp_path, global_hooks={"post_mlp": [0]})
 
+    def test_mlp_hooks_accepted(self, tmp_path: pathlib.Path) -> None:
+        # ``mlp_in``/``mlp_out`` are the transcoder taps wired on gemma3/4 and
+        # the qwen3 family; the validator must accept them (regression guard:
+        # they were previously rejected as "not yet wired").
+        _make_consumer(tmp_path, global_hooks={"mlp_in": [0], "mlp_out": [0]})
+
     def test_non_dict_global_hooks_rejected(self, tmp_path: pathlib.Path) -> None:
         with pytest.raises(ValueError, match="must be a dict"):
             _make_consumer(tmp_path, global_hooks=[0, 1])
