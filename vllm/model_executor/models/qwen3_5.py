@@ -36,6 +36,9 @@ from vllm.distributed import (
     get_pp_group,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.activation_capture import (
+    maybe_capture_residual,
+)
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
 )
@@ -193,6 +196,94 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     config.hidden_size,
                 ),
             )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        positions: torch.Tensor = None,
+        **kwargs: object,
+    ):
+        # Mirrors Qwen3NextDecoderLayer.forward, with activation-capture taps
+        # added for hook-based hidden-state extraction (Solution B). The taps
+        # are called UNCONDITIONALLY (the canonical pattern, as in gemma4.py):
+        # `maybe_capture_residual` routes through an opaque custom op that
+        # self-gates on the active capture manager — a no-op (torch.compile
+        # constant-folds the gate) when nothing is capturing. Calling them
+        # unconditionally is what lets the *global-spec* capture path bake its
+        # persistent-buffer copy into the CUDA graph at warmup; a Python
+        # `if capturing:` guard would specialize the graph to the warmup-time
+        # value and silently drop capture under CUDA graphs (Approach A2).
+        #
+        # Qwen3.5 uses vLLM's *fused* add-norm residual pattern: the residual
+        # stream is carried in `residual` and the add is folded into the next
+        # layernorm. So after each fused norm the returned `residual` IS the
+        # running residual stream — `pre_attn`/`post_attn` read it for free.
+        # The residual stream *after this block* (== HF hidden_states[idx+1],
+        # the value EagleModelMixin._maybe_add_hidden_state reconstructs and the
+        # value Solution A's connector validated) is `hidden_states + residual`
+        # of the return values; that add is otherwise deferred to the next
+        # layer's norm, so for `post_mlp` we materialize it (one extra add per
+        # layer; negligible vs the block's matmuls).
+
+        if residual is None:
+            # First layer: entering residual stream is the embedding itself.
+            maybe_capture_residual(hidden_states, self.layer_idx, "pre_attn")
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            maybe_capture_residual(residual, self.layer_idx, "pre_attn")
+
+        self_attention_output = torch.empty_like(hidden_states)
+        if self.layer_type == "linear_attention":
+            self.linear_attn(
+                hidden_states=hidden_states,
+                output=self_attention_output,
+            )
+        elif self.layer_type == "full_attention":
+            self.self_attn(
+                hidden_states=hidden_states,
+                output=self_attention_output,
+                positions=positions,
+            )
+        else:
+            raise ValueError("Invalid layer_type")
+        hidden_states = self_attention_output
+
+        if self.layer_scale:
+            if len(hidden_states.shape) == 2:
+                hidden_states = hidden_states * (
+                    self.attn_layer_scale.to(hidden_states.dtype)[0] + 1
+                )
+            else:
+                hidden_states = hidden_states * (
+                    self.attn_layer_scale.to(hidden_states.dtype) + 1
+                )
+
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        maybe_capture_residual(residual, self.layer_idx, "post_attn")
+        hidden_states = self.mlp(hidden_states)
+
+        if self.layer_scale:
+            if len(hidden_states.shape) == 2:
+                hidden_states = hidden_states * (
+                    self.ffn_layer_scale.to(hidden_states.dtype)[0] + 1
+                )
+            else:
+                assert len(hidden_states.shape) == len(self.ffn_layer_scale.shape), (
+                    f"shape must be the same {len(hidden_states.shape)}, "
+                    f"{len(self.ffn_layer_scale.shape)}"
+                )
+                hidden_states = hidden_states * (
+                    self.ffn_layer_scale.to(hidden_states.dtype) + 1
+                )
+
+        # Residual stream after this block (== HF hidden_states[idx+1]).
+        maybe_capture_residual(hidden_states + residual, self.layer_idx, "post_mlp")
+
+        return hidden_states, residual
 
 
 @support_torch_compile(
