@@ -108,6 +108,16 @@ class TestSaeScorerConsumer:
             # Every reported feature is genuinely active (sparsity sanity).
             assert all(v > 0 for v in payload["values"][r])
 
+    def test_skip_first_emits_empty_row0(self, monkeypatch):
+        consumer, sae = _make_consumer(monkeypatch, params={"skip_first": True})
+        x = torch.randn(3, HIDDEN)
+        payload = consumer.on_capture(_key(), x, {})
+        assert payload["num_rows"] == 3                 # row kept for alignment
+        assert payload["indices"][0] == [] and payload["values"][0] == []  # BOS skipped
+        ref = sae.encode(x)
+        for r in (1, 2):                                # other rows unaffected
+            assert payload["indices"][r] == ref[r].nonzero(as_tuple=True)[0].tolist()
+
     def test_on_capture_empty(self, monkeypatch):
         consumer, _ = _make_consumer(monkeypatch)
         payload = consumer.on_capture(_key(), torch.empty((0, HIDDEN)), {})

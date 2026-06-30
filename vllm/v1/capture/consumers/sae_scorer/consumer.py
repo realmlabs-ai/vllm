@@ -141,6 +141,11 @@ class SaeScorerConsumer(CaptureConsumer):
         # ``None`` (default) keeps every nonzero feature (true JumpReLU sparsity).
         topk = params.get("topk")
         self._topk: int | None = int(topk) if topk is not None else None
+        # ``skip_first``: emit no features for row 0 (the first captured position
+        # — BOS / attention-sink), whose SAE activation is anomalously dense
+        # (~half the dictionary) and uninformative. Skips its nonzero/tolist (the
+        # dominant per-request egress cost) while keeping the row for alignment.
+        self._skip_first: bool = bool(params.get("skip_first", False))
 
         # Store mode (solution 2): write scores to disk under ``out_dir`` and
         # return a handle. ``None`` keeps inline mode (return full scores).
@@ -198,7 +203,13 @@ class SaeScorerConsumer(CaptureConsumer):
 
         indices: list[list[int]] = []
         values: list[list[float]] = []
-        for row in feats:
+        for i, row in enumerate(feats):
+            if self._skip_first and i == 0:
+                # BOS / first-position row: dense artifact — emit empty, skip the
+                # costly sparsify, keep the row so downstream alignment holds.
+                indices.append([])
+                values.append([])
+                continue
             if self._topk is not None:
                 k = min(self._topk, row.numel())
                 vals, idx = torch.topk(row, k)
