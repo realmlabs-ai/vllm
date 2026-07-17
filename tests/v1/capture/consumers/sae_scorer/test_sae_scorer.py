@@ -21,7 +21,12 @@ from vllm.v1.capture.consumers.sae_scorer.consumer import (
     DEFAULT_SAE_SRC,
     SaeScorerConsumer,
 )
-from vllm.v1.capture.types import VllmInternalRequestId
+from vllm.v1.capture.errors import CaptureValidationError
+from vllm.v1.capture.types import (
+    CaptureContext,
+    VllmInternalRequestId,
+    min_captured_prompt_position,
+)
 
 HIDDEN = 8
 SAE_SIZE = 16
@@ -65,6 +70,19 @@ def _make_consumer(monkeypatch, *, sae=None, params=None):
 
 def _key():
     return (VllmInternalRequestId("r1"), 20, "post_mlp")
+
+
+def _ctx(num_prompt_tokens: int = 8, num_hidden_layers: int = 32) -> CaptureContext:
+    return CaptureContext(
+        vllm_internal_request_id=VllmInternalRequestId("r1"),
+        num_prompt_tokens=num_prompt_tokens,
+        num_computed_tokens=0,
+        num_hidden_layers=num_hidden_layers,
+        hidden_size=HIDDEN,
+        element_size_bytes=2,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+    )
 
 
 class TestSaeScorerConsumer:
@@ -133,3 +151,62 @@ class TestSaeScorerConsumer:
         payload = consumer.on_capture(_key(), torch.randn(5, HIDDEN), {})
         for row_idx in payload["indices"]:
             assert len(row_idx) <= 4
+
+
+class TestSaeScorerClientSpec:
+    """Per-request client-spec opt-in (Bug B fix — see docs/vllm/README.md).
+
+    Without ``reads_client_spec``/``validate_client_spec``, this consumer's
+    ``(layer, hook)`` tap is a pure *global* spec invisible to admission's
+    prefix-cache resolution, so automatic prefix caching (APC) can silently
+    skip forwarding — and therefore capturing — cached prompt positions.
+    """
+
+    def test_reads_client_spec_is_true(self):
+        assert SaeScorerConsumer.reads_client_spec is True
+
+    def test_validate_client_spec_matches_global_defaults(self, monkeypatch):
+        consumer, _ = _make_consumer(monkeypatch)
+        spec = consumer.validate_client_spec({}, _ctx())
+        assert spec.hooks == {"post_mlp": [20]}
+        assert spec.positions == "all"
+        # Same floor as the (never-visible-to-admission) global spec would
+        # imply, now actually reachable by resolve_capture_prefix_flags.
+        assert min_captured_prompt_position(spec, num_prompt_tokens=8) == 0
+
+    def test_validate_client_spec_accepts_none(self, monkeypatch):
+        consumer, _ = _make_consumer(monkeypatch)
+        spec = consumer.validate_client_spec(None, _ctx())
+        assert spec.hooks == {"post_mlp": [20]}
+
+    def test_validate_client_spec_honors_positions_override(self, monkeypatch):
+        consumer, _ = _make_consumer(monkeypatch)
+        spec = consumer.validate_client_spec({"positions": "last_prompt"}, _ctx())
+        assert spec.positions == "last_prompt"
+        assert spec.hooks == {"post_mlp": [20]}  # layer/hook stay server-configured
+
+    def test_validate_client_spec_matches_configured_layer_hook(self, monkeypatch):
+        consumer, _ = _make_consumer(
+            monkeypatch, params={"layer": 3, "hook": "pre_attn"}
+        )
+        spec = consumer.validate_client_spec({}, _ctx())
+        assert spec.hooks == {"pre_attn": [3]}
+
+    def test_validate_client_spec_rejects_non_dict(self, monkeypatch):
+        consumer, _ = _make_consumer(monkeypatch)
+        with pytest.raises(CaptureValidationError):
+            consumer.validate_client_spec("not-a-dict", _ctx())
+
+    def test_validate_client_spec_rejects_out_of_range_layer(self, monkeypatch):
+        consumer, _ = _make_consumer(monkeypatch, params={"layer": 40})
+        with pytest.raises(CaptureValidationError):
+            consumer.validate_client_spec({}, _ctx(num_hidden_layers=32))
+
+    def test_validate_client_spec_rejects_unwired_hook(self, monkeypatch):
+        consumer, _ = _make_consumer(monkeypatch, params={"hook": "mlp_in"})
+        ctx = _ctx()
+        # A non-empty hook_schema that doesn't include "mlp_in" (mirrors a
+        # real model's schema, which lists only its wired hooks).
+        ctx.hook_schema = {"post_mlp": object(), "pre_attn": object()}
+        with pytest.raises(CaptureValidationError):
+            consumer.validate_client_spec({}, ctx)

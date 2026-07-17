@@ -53,10 +53,12 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 import torch
 
 from vllm.v1.capture.consumer import CaptureConsumer
-from vllm.v1.capture.types import CaptureKey, CaptureSpec
+from vllm.v1.capture.errors import CaptureValidationError
+from vllm.v1.capture.types import CaptureKey, CaptureSpec, PositionSelector
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.capture.types import CaptureContext
 
 # Sensible defaults for this environment; every one is overridable via params.
 DEFAULT_SAE_SRC = "/home/mayank/research/ml_service/experimental/mayank/sae.py"
@@ -131,6 +133,22 @@ class SaeScorerConsumer(CaptureConsumer):
 
     location: Literal["worker", "driver"] = "worker"
     wants_device_tensors: ClassVar[bool] = True
+    # Per-request opt-in (``capture={"sae_scorer": {...}}``) makes this
+    # consumer's tap visible to admission's prefix-cache resolution
+    # (``resolve_capture_prefix_flags``), the same way the built-in
+    # ``filesystem`` consumer already is. Without this, the consumer's
+    # ``(layer, hook)`` tap is a *global* spec the scheduler's automatic
+    # prefix caching (APC) cannot see: APC skips forwarding cached prompt
+    # positions, so the tap never fires for them, and a capture that expects
+    # every prompt position comes back short — the request either times out
+    # waiting for the missing rows or is served a truncated result. Giving
+    # the consumer a client spec lets admission stamp a re-forward floor
+    # (``capture_min_prompt_position``) that APC actually honors: cached
+    # rows below the floor still hit, only the floor-and-above range is
+    # forced to re-forward (and thus capture). See ``DELIVERY_NOTES.md``
+    # and ``docs/vllm/single-pass-sae-plan.md`` (Option A) in the
+    # companion ml_service repo for the full rationale.
+    reads_client_spec: ClassVar[bool] = True
 
     def __init__(self, vllm_config: VllmConfig, params: dict[str, Any]) -> None:
         super().__init__(vllm_config, params)
@@ -176,6 +194,56 @@ class SaeScorerConsumer(CaptureConsumer):
             hooks={self._hook: [self._layer]},
             positions=self._positions,
         )
+
+    def validate_client_spec(
+        self,
+        raw_spec: Any,
+        ctx: "CaptureContext",
+    ) -> CaptureSpec:
+        """Per-request opt-in for this consumer's fixed ``(layer, hook)`` tap.
+
+        This consumer's capture target is *server-configured*
+        (``self._layer``/``self._hook``), not client-supplied — so unlike
+        ``FilesystemConsumer.validate_client_spec`` there is no rich
+        per-request payload to parse. The only thing a client can override
+        is ``positions`` (e.g. narrow to ``"last_prompt"`` for a single
+        request); everything else always resolves to the consumer's own
+        config. The point of this method existing at all is to make that
+        config visible to admission as a *client* spec — a bare
+        ``capture={"sae_scorer": {}}`` (or the registered instance name) is
+        enough opt-in; admission then runs ``min_captured_prompt_position``
+        over the returned spec and stamps the prefix-cache floor, which a
+        *global*-only spec never gets (see ``reads_client_spec`` docstring
+        above).
+
+        Accepts ``None``, ``{}``, or ``{"positions": <selector>}``. Raises
+        ``CaptureValidationError`` if the consumer's configured layer/hook
+        don't fit this request's model (should only happen with a
+        misconfigured ``sae_scorer:layer=...`` param — the same config
+        serves every request).
+        """
+        if raw_spec is None:
+            raw_spec = {}
+        if not isinstance(raw_spec, dict):
+            raise CaptureValidationError(
+                f"sae_scorer capture spec must be a dict (or null), got "
+                f"{type(raw_spec).__name__}"
+            )
+
+        if ctx.num_hidden_layers > 0 and not (0 <= self._layer < ctx.num_hidden_layers):
+            raise CaptureValidationError(
+                f"sae_scorer is configured for layer {self._layer}, which is "
+                f"out of range for this model ({ctx.num_hidden_layers} layers)"
+            )
+        valid_hooks = frozenset(ctx.hook_schema) if ctx.hook_schema else None
+        if valid_hooks is not None and self._hook not in valid_hooks:
+            raise CaptureValidationError(
+                f"sae_scorer is configured for hook {self._hook!r}, which "
+                f"this model does not tap (available: {sorted(valid_hooks)})"
+            )
+
+        positions: PositionSelector = raw_spec.get("positions", self._positions)
+        return CaptureSpec(hooks={self._hook: [self._layer]}, positions=positions)
 
     @torch.inference_mode()
     def _score(self, tensor: torch.Tensor) -> dict[str, Any]:
