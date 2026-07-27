@@ -248,12 +248,30 @@ class KVCacheManager:
             # clamp below applies, so a captured position is never served from
             # the KV cache without its residual being available.
             sp = request.sampling_params
-            served = sp is not None and try_reserve_store_serve(
-                request.request_id,
-                request.block_hashes,
-                self.hash_block_size,
-                sp.capture_store_hook_layers or [],
-                sp.capture_store_positions or [],
+            # A whole-prefix serve is sound only when every captured position
+            # sits below the block-aligned reuse boundary. Even on a full cache
+            # hit the last block is recomputed for logits (see
+            # max_cache_hit_length above), and that forward fires the capture
+            # hooks for its positions -- serving those same positions from the
+            # store emits them twice. A block-aligned prompt came back with
+            # num_tokens + block_size rows, its final block duplicated
+            # bit-for-bit; other lengths escaped only because a partial
+            # trailing block is unhashable and the reservation already bailed.
+            positions = (sp.capture_store_positions or []) if sp is not None else []
+            reuse_boundary = (
+                (request.num_tokens - 1) // self.hash_block_size
+            ) * self.hash_block_size
+            served = (
+                sp is not None
+                and bool(positions)
+                and max(positions) < reuse_boundary
+                and try_reserve_store_serve(
+                    request.request_id,
+                    request.block_hashes,
+                    self.hash_block_size,
+                    sp.capture_store_hook_layers or [],
+                    positions,
+                )
             )
             if not served:
                 max_cache_hit_length = min(max_cache_hit_length, capture_limit)

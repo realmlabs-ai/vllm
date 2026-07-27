@@ -39,6 +39,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation_capture import maybe_capture_residual
 from vllm.model_executor.layers.attention import (
     Attention,
     EncoderOnlyAttention,
@@ -465,6 +466,11 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        # Live tensor (feeds the LM head), so the capture op survives inductor DCE --
+        # unlike post_block's dead ``residual + hidden_states`` temporary.
+        maybe_capture_residual(
+            hidden_states, self.config.num_hidden_layers - 1, "post_norm"
+        )
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
