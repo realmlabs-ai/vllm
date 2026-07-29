@@ -1283,15 +1283,28 @@ class EngineCoreProc(EngineCore):
                 if block and self.vllm_config.capture_consumers_config is not None:
                     # Capture finalize is asynchronous (writer threads); when
                     # the engine is idle there is no ModelRunnerOutput to
-                    # carry late results to ``capture_wait`` clients. Wait
-                    # with a bounded timeout and drain/emit on each tick.
+                    # carry late results to ``capture_wait`` clients. Finalize
+                    # lands within milliseconds of the final step, so poll
+                    # fast right after going idle and back off exponentially
+                    # to a 1 Hz heartbeat once drains come up empty -- a
+                    # fixed 1.0 s tick put a ~1 s floor on every lone
+                    # capture_wait request.
                     try:
-                        req = self.input_queue.get(timeout=1.0)
+                        req = self.input_queue.get(
+                            timeout=self._capture_drain_timeout
+                        )
                     except queue.Empty:
-                        self._emit_late_capture_results()
+                        if self._emit_late_capture_results():
+                            self._capture_drain_timeout = 0.005
+                        else:
+                            self._capture_drain_timeout = min(
+                                self._capture_drain_timeout * 2, 1.0
+                            )
                         continue
                 else:
                     req = self.input_queue.get(block=block)
+                # Activity means new results may be imminent: re-arm fast polling.
+                self._capture_drain_timeout = 0.005
                 self._handle_client_request(*req)
             except queue.Empty:
                 break
@@ -1306,8 +1319,16 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
-    def _emit_late_capture_results(self) -> None:
-        """Deliver capture results that finalized while the engine is idle."""
+    # Idle-loop drain cadence; reset to fast on any activity or emission
+    # (see _process_input_queue).
+    _capture_drain_timeout: float = 0.005
+
+    def _emit_late_capture_results(self) -> bool:
+        """Deliver capture results that finalized while the engine is idle.
+
+        Returns whether anything was emitted, so the idle loop can keep
+        polling fast while results are still trickling in.
+        """
         from vllm.v1.engine import EngineCoreOutputs
 
         merged: dict = {}
@@ -1317,7 +1338,7 @@ class EngineCoreProc(EngineCore):
             if rank_results:
                 merged.update(rank_results)
         if not merged:
-            return
+            return False
         # Route each request's late results to the front-end that issued it
         # (default 0), so multi-client / data-parallel deployments don't lose
         # them to client 0.
@@ -1330,6 +1351,7 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(
                 (client_index, EngineCoreOutputs(late_capture_results=results))
             )
+        return True
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
