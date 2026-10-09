@@ -171,7 +171,7 @@ def parse_consumer_spec(shorthand: str) -> CaptureConsumerSpec:
 
 
 _VALID_HOOK_NAMES = frozenset(
-    {"pre_attn", "post_attn", "post_block", "mlp_in", "mlp_out"}
+    {"pre_attn", "post_attn", "post_block", "mlp_in", "mlp_out", "post_norm"}
 )
 
 

@@ -48,6 +48,9 @@ HookName = Literal[
     "post_block",
     "mlp_in",
     "mlp_out",
+    # Stack-final norm output, fired at layer ``num_hidden_layers - 1``:
+    # post-final-RMSNorm == HF's last ``hidden_states`` entry.
+    "post_norm",
 ]
 
 PositionSelector = (

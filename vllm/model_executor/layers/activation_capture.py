@@ -48,6 +48,10 @@ _HOOK_NAME_TO_ID: dict[str, int] = {
     "post_block": 2,
     "mlp_in": 3,
     "mlp_out": 4,
+    # Stack-final norm output, fired at ``layer_idx = num_hidden_layers - 1``: the only
+    # tap outside a decoder layer. ``post_norm@(n-1) == HF hidden_states[n]``, which
+    # ``post_block`` cannot serve -- its tapped temporary is dead and inductor drops it.
+    "post_norm": 5,
 }
 _HOOK_ID_TO_NAME: dict[int, str] = {v: k for k, v in _HOOK_NAME_TO_ID.items()}
 

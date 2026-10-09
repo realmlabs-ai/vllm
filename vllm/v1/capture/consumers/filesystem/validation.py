@@ -65,8 +65,12 @@ if TYPE_CHECKING:
 # produce an empty, zero-byte capture. Keep them out of the accepted set
 # so admission rejects them until they are wired; re-add here once
 # implemented.
+#
+# ``post_norm`` IS wired (llama / qwen2 / qwen3_next stack forwards) but fires
+# only at ``layer_idx = num_hidden_layers - 1`` -- it taps the stack-final norm,
+# not a per-layer point. Requesting it at any other layer captures nothing.
 _VALID_HOOK_NAMES: frozenset[str] = frozenset(
-    ("pre_attn", "post_attn", "post_block")
+    ("pre_attn", "post_attn", "post_block", "post_norm")
 )
 
 _VALID_POSITION_KINDS: frozenset[str] = frozenset(
