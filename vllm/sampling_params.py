@@ -517,6 +517,7 @@ class SamplingParams(
         steering_vectors: SteeringVectorSpec | None = None,
         prefill_steering_vectors: SteeringVectorSpec | None = None,
         decode_steering_vectors: SteeringVectorSpec | None = None,
+        neuron_steering: str | None = None,
         steering_module_ref: tuple[str, float] | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
@@ -563,6 +564,7 @@ class SamplingParams(
             steering_vectors=steering_vectors,
             prefill_steering_vectors=prefill_steering_vectors,
             decode_steering_vectors=decode_steering_vectors,
+            neuron_steering=neuron_steering,
             steering_module_ref=steering_module_ref,
         )
 
