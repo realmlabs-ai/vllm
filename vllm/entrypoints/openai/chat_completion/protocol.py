@@ -521,6 +521,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "decode only. Same packed format as steering_vectors.",
     )
 
+    neuron_steering: str | None = Field(
+        default=None,
+        description="Name of a neuron-steering preset the server was started "
+        "with (--neuron-steering-presets); applied at every token of this "
+        "request. Unset: no neuron steering.",
+    )
+
     steering_name: str | None = Field(
         default=None,
         description="Name of a pre-registered steering module. "
@@ -760,6 +767,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             decode_steering_vectors=unpack_steering_vectors(
                 self.decode_steering_vectors
             ),
+            neuron_steering=self.neuron_steering,
         )
         # Attach the capture dict (keyed by consumer name). The
         # entrypoint's ``_admit_capture`` mutates each value in place

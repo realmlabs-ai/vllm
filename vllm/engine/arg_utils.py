@@ -58,6 +58,7 @@ from vllm.config import (
     ReasoningConfig,
     SchedulerConfig,
     SpeculativeConfig,
+    NeuronSteeringConfig,
     SteeringConfig,
     StructuredOutputsConfig,
     UVAOffloadConfig,
@@ -596,6 +597,7 @@ class EngineArgs:
     # Steering fields
     enable_steering: bool = False
     max_steering_configs: int = SteeringConfig.max_steering_configs
+    neuron_steering_presets: str | None = None
 
     # --capture-consumers is repeatable (action="append"); when unset the
     # whole capture-consumer pipeline stays disabled.
@@ -1458,6 +1460,14 @@ class EngineArgs:
             "--max-steering-configs",
             **steering_kwargs["max_steering_configs"],
         )
+        steering_group.add_argument(
+            "--neuron-steering-presets",
+            type=str,
+            default=None,
+            help="JSON file of named neuron-steering presets (MLP-intermediate "
+            "transport maps). Requests pick one by name with `neuron_steering`. "
+            "Unset: no neuron-steering buffers or ops in the model.",
+        )
 
         # Observability arguments
         observability_kwargs = get_kwargs(ObservabilityConfig)
@@ -2191,6 +2201,11 @@ class EngineArgs:
             if self.enable_steering
             else None
         )
+        neuron_steering_config = (
+            NeuronSteeringConfig.from_file(self.neuron_steering_presets)
+            if self.neuron_steering_presets
+            else None
+        )
 
         self._set_default_max_num_seqs_and_batched_tokens_args(
             usage_context,
@@ -2530,6 +2545,7 @@ class EngineArgs:
             lora_config=lora_config,
             capture_consumers_config=capture_consumers_config,
             steering_config=steering_config,
+            neuron_steering_config=neuron_steering_config,
             speculative_config=speculative_config,
             diffusion_config=diffusion_config,
             structured_outputs_config=self.structured_outputs_config,

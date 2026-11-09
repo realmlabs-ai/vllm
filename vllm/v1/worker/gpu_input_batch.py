@@ -93,6 +93,10 @@ class CachedRequestState:
 
 
 class InputBatch:
+    # Neuron-steering preset name -> table row (row 0 = none); set by the
+    # GPU model runner at init when ``--neuron-steering-presets`` is given.
+    nsteer_rows: dict[str, int] = {}
+
     def __init__(
         self,
         max_num_reqs: int,
@@ -259,6 +263,11 @@ class InputBatch:
         )
         # Tracks the union of both hashes (any non-zero hash gets tracked)
         self.steering_hash_to_request_ids: dict[int, set[str]] = {}
+
+        # Neuron steering: per-request preset row (0 = none). The class-level
+        # ``nsteer_rows`` (preset name -> row) is set once by the model runner.
+        self.request_nsteer_row = np.zeros((self.max_num_reqs,), dtype=np.int64)
+        self.num_nsteer_reqs = 0
 
         # req_index -> generator
         # NOTE(woosuk): The indices of the requests that do not have their own
@@ -492,6 +501,15 @@ class InputBatch:
             # No LoRA
             self.request_lora_mapping[req_index] = 0
 
+        # Neuron steering preset row (names were validated at admission).
+        nsteer_name = (
+            request.sampling_params.neuron_steering if request.sampling_params else None
+        )
+        nsteer_row = self.nsteer_rows.get(nsteer_name, 0) if nsteer_name else 0
+        self.request_nsteer_row[req_index] = nsteer_row
+        if nsteer_row:
+            self.num_nsteer_reqs += 1
+
         # Steering config tracking (prefill and decode)
         prefill_hash = request.prefill_steering_config_hash
         decode_hash = request.decode_steering_config_hash
@@ -561,6 +579,10 @@ class InputBatch:
                 del self.lora_id_to_request_ids[lora_id]
                 del self.lora_id_to_lora_request[lora_id]
             self.request_lora_mapping[req_index] = 0
+
+        if self.request_nsteer_row[req_index]:
+            self.num_nsteer_reqs -= 1
+            self.request_nsteer_row[req_index] = 0
 
         # Steering cleanup (both prefill and decode hashes)
         for arr in (
@@ -681,6 +703,10 @@ class InputBatch:
         self.request_decode_steering_hash[i1], self.request_decode_steering_hash[i2] = (
             self.request_decode_steering_hash[i2],
             self.request_decode_steering_hash[i1],
+        )
+        self.request_nsteer_row[i1], self.request_nsteer_row[i2] = (
+            self.request_nsteer_row[i2],
+            self.request_nsteer_row[i1],
         )
 
         if self.is_pooling_model:
@@ -817,6 +843,8 @@ class InputBatch:
             self.request_decode_steering_hash[empty_index] = (
                 self.request_decode_steering_hash[last_req_index]
             )
+            self.request_nsteer_row[empty_index] = self.request_nsteer_row[last_req_index]
+            self.request_nsteer_row[last_req_index] = 0
 
             if self.is_pooling_model:
                 last_req_index -= 1

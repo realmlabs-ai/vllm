@@ -822,6 +822,15 @@ class GPUModelRunner(
         )
         self._init_block_sizes = [placeholder_block_size]
         self._init_kernel_block_sizes = [placeholder_block_size]
+        nsteer_cfg = getattr(self.vllm_config, "neuron_steering_config", None)
+        InputBatch.nsteer_rows = (
+            {name: i + 1 for i, name in enumerate(nsteer_cfg.names)} if nsteer_cfg else {}
+        )
+        self._nsteer_enabled = bool(nsteer_cfg)
+        self._nsteer_index: torch.Tensor | None = None
+        self._nsteer_index_pinned: torch.Tensor | None = None
+        self._nsteer_resolved = False
+        self._nsteer_dirty = False
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             # We need to use the encoder length for encoder-decoder
@@ -4561,6 +4570,52 @@ class GPUModelRunner(
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
     @torch.inference_mode()
+    def _update_neuron_steering_index(self, scheduler_output: "SchedulerOutput") -> None:
+        """Write each scheduled token's neuron-steering preset row into the
+        index shared by the steerable MLPs (row 0 = no steering).
+
+        Skipped entirely while no request in the batch selected a preset; the
+        index is zeroed once on the steered -> unsteered transition.
+        """
+        if not self._nsteer_enabled:
+            return
+        if not self._nsteer_resolved:
+            from vllm.model_executor.layers.neuron_steering import NSTEER_INDEX_ATTR
+
+            self._nsteer_resolved = True
+            for m in self.get_model().modules():
+                idx = getattr(m, NSTEER_INDEX_ATTR, None)
+                if idx is not None:
+                    self._nsteer_index = idx
+                    self._nsteer_index_pinned = torch.zeros(
+                        idx.shape[0], dtype=torch.long, pin_memory=self.pin_memory
+                    )
+                    break
+        index = self._nsteer_index
+        if index is None:
+            return
+        ib = self.input_batch
+        if ib.num_nsteer_reqs == 0:
+            if self._nsteer_dirty:
+                index.zero_()
+                self._nsteer_dirty = False
+            return
+        num_reqs = ib.num_reqs
+        counts = np.fromiter(
+            (scheduler_output.num_scheduled_tokens.get(r, 0) for r in ib.req_ids[:num_reqs]),
+            dtype=np.int64,
+            count=num_reqs,
+        )
+        expanded = np.repeat(ib.request_nsteer_row[:num_reqs], counts)
+        n = min(int(expanded.shape[0]), index.shape[0])
+        pinned = self._nsteer_index_pinned
+        assert pinned is not None
+        pinned[:n].copy_(torch.from_numpy(expanded[:n]))
+        index[:n].copy_(pinned[:n], non_blocking=True)
+        if n < index.shape[0]:
+            index[n:].zero_()
+        self._nsteer_dirty = True
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4853,6 +4908,7 @@ class GPUModelRunner(
 
         # Update per-request steering tables and index before forward.
         self._update_steering_buffers(scheduler_output)
+        self._update_neuron_steering_index(scheduler_output)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
