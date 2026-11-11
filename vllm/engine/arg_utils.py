@@ -597,7 +597,7 @@ class EngineArgs:
     # Steering fields
     enable_steering: bool = False
     max_steering_configs: int = SteeringConfig.max_steering_configs
-    neuron_steering_presets: str | None = None
+    neuron_steering_ranking: str | None = None
 
     # --capture-consumers is repeatable (action="append"); when unset the
     # whole capture-consumer pipeline stays disabled.
@@ -1461,11 +1461,12 @@ class EngineArgs:
             **steering_kwargs["max_steering_configs"],
         )
         steering_group.add_argument(
-            "--neuron-steering-presets",
+            "--neuron-steering-ranking",
             type=str,
             default=None,
-            help="JSON file of named neuron-steering presets (MLP-intermediate "
-            "transport maps). Requests pick one by name with `neuron_steering`. "
+            help="JSON neuron ranking for per-request neuron steering (MLP-intermediate "
+            "transport maps; Veer's steer.json format). Requests steer with "
+            "`neuron_steering='<reflect|amplify>:top<k>:<q>:<strength>:all'`. "
             "Unset: no neuron-steering buffers or ops in the model.",
         )
 
@@ -2202,8 +2203,8 @@ class EngineArgs:
             else None
         )
         neuron_steering_config = (
-            NeuronSteeringConfig.from_file(self.neuron_steering_presets)
-            if self.neuron_steering_presets
+            NeuronSteeringConfig.from_file(self.neuron_steering_ranking)
+            if self.neuron_steering_ranking
             else None
         )
 

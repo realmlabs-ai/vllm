@@ -249,9 +249,9 @@ class CompletionRequest(OpenAIBaseModel):
 
     neuron_steering: str | None = Field(
         default=None,
-        description="Name of a neuron-steering preset the server was started "
-        "with (--neuron-steering-presets); applied at every token of this "
-        "request. Unset: no neuron steering.",
+        description="Neuron-steering spec '<reflect|amplify>:top<k>:<q>:<strength>:all' "
+        "over the ranking the server was started with (--neuron-steering-ranking); "
+        "applied at every token of this request. Unset: no neuron steering.",
     )
 
     steering_name: str | None = Field(

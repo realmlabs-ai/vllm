@@ -190,9 +190,9 @@ class InputProcessor:
             if not self.neuron_steering_config:
                 raise ValueError(
                     "neuron_steering was requested but the server has no "
-                    "neuron-steering presets (--neuron-steering-presets)."
+                    "neuron-steering ranking (--neuron-steering-ranking)."
                 )
-            self.neuron_steering_config.row_of(params.neuron_steering)  # raises on unknown names
+            self.neuron_steering_config.parse(params.neuron_steering)  # raises on a bad spec
 
     def _get_mm_identifier(
         self,

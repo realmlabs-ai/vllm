@@ -430,8 +430,9 @@ class SamplingParams(
     Same format as ``steering_vectors``."""
 
     neuron_steering: str | None = None
-    """Name of a neuron-steering preset (``--neuron-steering-presets``),
-    applied at every token of the request. ``None``: no neuron steering."""
+    """Neuron-steering spec ``<reflect|amplify>:top<k>:<q>:<strength>:all`` over the
+    server's ranking (``--neuron-steering-ranking``), applied at every token of the
+    request. ``None``: no neuron steering."""
 
     _effective_prefill_steering_packed: dict[str, dict[int, np.ndarray]] | None = None
     """In-process pre-resolved + packed prefill-phase steering, in the

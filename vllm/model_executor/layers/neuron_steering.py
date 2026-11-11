@@ -2,20 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Per-request neuron steering on the MLP intermediate (the input of ``down_proj``).
 
-Each steerable MLP carries four small tables of shape ``(num_presets + 1, K)``
--- neuron index, orientation ``s``, threshold ``theta``, coefficient ``c`` --
-plus a per-token row index shared by all steerable MLPs (row 0 = no steering,
-row ``i`` = preset ``NeuronSteeringConfig.names[i - 1]``). The model runner
-writes the row index before each forward. For every token::
+Each steerable MLP carries fixed tables for the ranked neurons in its layer (from
+``NeuronSteeringConfig``): neuron index ``idx (K,)``, orientation ``s (K,)``, global rank
+``rank (K,)`` and thresholds ``theta (101, K)`` by percentile index. Three per-token vectors are
+shared by every steerable MLP and written by the model runner before each forward: ``k`` (how
+many of the ranking's top neurons the token's request steers; 0 = none), ``q`` (percentile
+index) and ``c`` (coefficient). For every token and every neuron of the layer::
 
-    h[n] <- h[n] + c * s * relu(s * (h[n] - theta))      for the K slots of its row
+    active = rank < k
+    h[n] <- h[n] + (c * active) * s * relu(s * (h[n] - theta[q]))
 
-computed in float32 and cast back, matching the HF reference hooks. Row 0 and
-padding slots have ``c = 0`` and point at distinct neurons, so they write each
-value back unchanged and the scatter never writes one position twice.
+computed in float32 and cast back, matching the HF reference hooks. An inactive neuron or an
+unsteered token (``k = 0``, ``c = 0``) gets ``h + 0``: its value is written back unchanged.
 
-The op is a plain functional custom op (no host sync, no data-dependent
-shapes), so it is captured inside both piecewise and full CUDA graphs.
+Only the per-token vectors depend on what requests send; the tables and shapes are fixed by the
+ranking, so the op is a plain functional custom op (no host sync, no data-dependent shapes)
+captured inside both piecewise and full CUDA graphs.
 """
 
 from __future__ import annotations
@@ -31,8 +33,8 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.neuron_steering import NeuronSteeringConfig
 
-NSTEER_ATTRS = ("nsteer_idx", "nsteer_s", "nsteer_theta", "nsteer_c")
-NSTEER_INDEX_ATTR = "nsteer_index"
+NSTEER_ATTRS = ("nsteer_idx", "nsteer_s", "nsteer_rank", "nsteer_theta")
+NSTEER_TOKEN_ATTRS = ("nsteer_k", "nsteer_q", "nsteer_c")
 
 
 def neuron_steering_config(vllm_config: VllmConfig) -> NeuronSteeringConfig | None:
@@ -40,34 +42,22 @@ def neuron_steering_config(vllm_config: VllmConfig) -> NeuronSteeringConfig | No
 
 
 def build_layer_tables(cfg: NeuronSteeringConfig, layer_idx: int, intermediate_size: int):
-    """``(idx, s, theta, c)`` CPU tables for one layer, rows = [none] + presets."""
-    names, k = cfg.names, cfg.max_neurons_per_layer
-    rows = len(names) + 1
-    idx = torch.zeros(rows, k, dtype=torch.long)
-    s = torch.ones(rows, k, dtype=torch.float32)
-    theta = torch.zeros(rows, k, dtype=torch.float32)
-    c = torch.zeros(rows, k, dtype=torch.float32)
-    idx[0] = torch.arange(k)
-    for r, name in enumerate(names, start=1):
-        entries = cfg.presets[name].get(layer_idx, [])
-        used = {n for n, *_ in entries}
-        for n, *_ in entries:
-            if not 0 <= n < intermediate_size:
-                raise ValueError(f"neuron steering: preset {name!r} layer {layer_idx}: neuron {n} out of range")
-        pad = (p for p in range(intermediate_size) if p not in used)
-        for j in range(k):
-            if j < len(entries):
-                n, sj, tj, cj = entries[j]
-                idx[r, j], s[r, j], theta[r, j], c[r, j] = n, sj, tj, cj
-            else:
-                idx[r, j] = next(pad)  # distinct, untouched neuron; c = 0 writes it back unchanged
-    return idx, s, theta, c
+    """``(idx, s, rank, theta)`` CPU tables for the ranked neurons of one layer."""
+    entries = cfg.layer_entries(layer_idx)
+    for _rank, n, _s, _t in entries:
+        if not 0 <= n < intermediate_size:
+            raise ValueError(f"neuron steering: layer {layer_idx}: neuron {n} out of range")
+    idx = torch.tensor([n for _, n, _, _ in entries], dtype=torch.long)
+    s = torch.tensor([sj for _, _, sj, _ in entries], dtype=torch.float32)
+    rank = torch.tensor([r for r, _, _, _ in entries], dtype=torch.long)
+    theta = torch.tensor([t for _, _, _, t in entries], dtype=torch.float32).T.contiguous()  # (101, K)
+    return idx, s, rank, theta
 
 
 def register_mlp_neuron_steering(
     mlp: nn.Module, cfg: NeuronSteeringConfig | None, layer_idx: int, intermediate_size: int
 ) -> bool:
-    """Attach the tables to ``mlp`` if any preset steers ``layer_idx``. Returns whether it did."""
+    """Attach the tables to ``mlp`` if the ranking has neurons in ``layer_idx``. Returns whether it did."""
     if cfg is None or layer_idx not in cfg.layers:
         return False
     from vllm.distributed import get_tensor_model_parallel_world_size
@@ -79,23 +69,32 @@ def register_mlp_neuron_steering(
     return True
 
 
-def share_neuron_steering_index(mlps: list[nn.Module], max_tokens: int) -> torch.Tensor | None:
-    """One ``(max_tokens,)`` row-index tensor shared by every steerable MLP."""
+def share_neuron_steering_index(
+    mlps: list[nn.Module], max_tokens: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """The per-token ``(k, q, c)`` vectors, ``(max_tokens,)`` each, shared by every steerable MLP."""
     steered = [m for m in mlps if hasattr(m, NSTEER_ATTRS[0])]
     if not steered:
         return None
-    index = torch.zeros(max_tokens, dtype=torch.long, device=getattr(steered[0], NSTEER_ATTRS[0]).device)
+    dev = getattr(steered[0], NSTEER_ATTRS[0]).device
+    vecs = (
+        torch.zeros(max_tokens, dtype=torch.long, device=dev),
+        torch.zeros(max_tokens, dtype=torch.long, device=dev),
+        torch.zeros(max_tokens, dtype=torch.float32, device=dev),
+    )
     for m in steered:
-        m.register_buffer(NSTEER_INDEX_ATTR, index, persistent=False)
-    return index
+        for attr, v in zip(NSTEER_TOKEN_ATTRS, vecs):
+            m.register_buffer(attr, v, persistent=False)
+    return vecs
 
 
 def maybe_apply_mlp_neuron_steering(mlp: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """Static per-module branch: MLPs without tables emit no op at all."""
-    if not hasattr(mlp, NSTEER_INDEX_ATTR):
+    if not hasattr(mlp, NSTEER_TOKEN_ATTRS[0]):
         return x
     return torch.ops.vllm.apply_neuron_steering(
-        x, mlp.nsteer_idx, mlp.nsteer_s, mlp.nsteer_theta, mlp.nsteer_c, mlp.nsteer_index
+        x, mlp.nsteer_idx, mlp.nsteer_s, mlp.nsteer_rank, mlp.nsteer_theta,
+        mlp.nsteer_k, mlp.nsteer_q, mlp.nsteer_c,
     )
 
 
@@ -103,19 +102,20 @@ def apply_neuron_steering(
     x: torch.Tensor,
     idx: torch.Tensor,
     s: torch.Tensor,
+    rank: torch.Tensor,
     theta: torch.Tensor,
+    k: torch.Tensor,
+    q: torch.Tensor,
     c: torch.Tensor,
-    index: torch.Tensor,
 ) -> torch.Tensor:
-    r = index[: x.shape[0]]
-    cols = idx[r]  # (T, K)
-    h = torch.gather(x, 1, cols).float()
-    sr = s[r]
-    new = h + c[r] * sr * torch.relu(sr * (h - theta[r]))
-    return x.scatter(1, cols, new.to(x.dtype))
+    t = x.shape[0]
+    h = x.index_select(1, idx).float()                                   # (T, K)
+    coef = c[:t, None] * (rank[None, :] < k[:t, None])                   # (T, K)
+    new = h + coef * s * torch.relu(s * (h - theta[q[:t]]))
+    return x.index_copy(1, idx, new.to(x.dtype))
 
 
-def apply_neuron_steering_fake(x, idx, s, theta, c, index) -> torch.Tensor:
+def apply_neuron_steering_fake(x, idx, s, rank, theta, k, q, c) -> torch.Tensor:
     return torch.empty_like(x)
 
 

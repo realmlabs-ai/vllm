@@ -367,7 +367,7 @@ class VllmConfig:
     steering_config: SteeringConfig | None = None
     """Per-request activation steering configuration."""
     neuron_steering_config: NeuronSteeringConfig | None = None
-    """Named per-request neuron-steering presets (``--neuron-steering-presets``).
+    """Per-request neuron steering over a fixed ranking (``--neuron-steering-ranking``).
     ``None`` means no neuron-steering buffers or ops anywhere in the model."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
