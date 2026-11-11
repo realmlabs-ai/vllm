@@ -84,6 +84,8 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+from vllm.model_executor.layers.neuron_steering import maybe_apply_mlp_neuron_steering
+
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -124,6 +126,9 @@ class Qwen2MoeMLP(nn.Module):
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
         out = self.act_fn(gate_up)
+        # Per-request neuron steering (Qwen3.5 only registers the tables; every
+        # other MLP has none, so this is a static no-op branch for them).
+        out = maybe_apply_mlp_neuron_steering(self, out)
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:

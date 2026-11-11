@@ -50,6 +50,7 @@ class InputProcessor:
         self.structured_outputs_config = vllm_config.structured_outputs_config
         self.observability_config = vllm_config.observability_config
         self.steering_config = vllm_config.steering_config
+        self.neuron_steering_config = getattr(vllm_config, "neuron_steering_config", None)
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
 
         self.generation_config_fields = model_config.try_get_generation_config()
@@ -185,6 +186,13 @@ class InputProcessor:
                 "is not enabled. Start the server with --enable-steering "
                 "to use per-request steering vectors."
             )
+        if params.neuron_steering is not None:
+            if not self.neuron_steering_config:
+                raise ValueError(
+                    "neuron_steering was requested but the server has no "
+                    "neuron-steering ranking (--neuron-steering-ranking)."
+                )
+            self.neuron_steering_config.parse(params.neuron_steering)  # raises on a bad spec
 
     def _get_mm_identifier(
         self,

@@ -429,6 +429,11 @@ class SamplingParams(
     """Phase-specific steering vectors added to base during decode only.
     Same format as ``steering_vectors``."""
 
+    neuron_steering: str | None = None
+    """Neuron-steering spec ``<reflect|amplify>:top<k>:<q>:<strength>:all`` over the
+    server's ranking (``--neuron-steering-ranking``), applied at every token of the
+    request. ``None``: no neuron steering."""
+
     _effective_prefill_steering_packed: dict[str, dict[int, np.ndarray]] | None = None
     """In-process pre-resolved + packed prefill-phase steering, in the
     model's compute dtype.  Equivalent to
@@ -513,6 +518,7 @@ class SamplingParams(
         steering_vectors: SteeringVectorSpec | None = None,
         prefill_steering_vectors: SteeringVectorSpec | None = None,
         decode_steering_vectors: SteeringVectorSpec | None = None,
+        neuron_steering: str | None = None,
         steering_module_ref: tuple[str, float] | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
@@ -559,6 +565,7 @@ class SamplingParams(
             steering_vectors=steering_vectors,
             prefill_steering_vectors=prefill_steering_vectors,
             decode_steering_vectors=decode_steering_vectors,
+            neuron_steering=neuron_steering,
             steering_module_ref=steering_module_ref,
         )
 

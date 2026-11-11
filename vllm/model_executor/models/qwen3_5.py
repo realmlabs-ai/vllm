@@ -53,6 +53,11 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.neuron_steering import (
+    neuron_steering_config,
+    register_mlp_neuron_steering,
+    share_neuron_steering_index,
+)
 from vllm.model_executor.layers.steering import (
     get_steering_buffer_config,
     get_steering_buffer_dtype,
@@ -187,6 +192,12 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
+            register_mlp_neuron_steering(
+                self.mlp,
+                neuron_steering_config(vllm_config),
+                self.layer_idx,
+                config.intermediate_size,
+            )
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")
 
@@ -258,6 +269,10 @@ class Qwen3_5Model(Qwen3NextModel):
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
         share_steering_index_across_layers(self.layers)
+        share_neuron_steering_index(
+            [getattr(layer, "mlp", None) for layer in self.layers if hasattr(layer, "mlp")],
+            vllm_config.scheduler_config.max_num_batched_tokens,
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )

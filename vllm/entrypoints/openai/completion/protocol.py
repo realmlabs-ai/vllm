@@ -247,6 +247,13 @@ class CompletionRequest(OpenAIBaseModel):
         "decode only. Same packed format as steering_vectors.",
     )
 
+    neuron_steering: str | None = Field(
+        default=None,
+        description="Neuron-steering spec '<reflect|amplify>:top<k>:<q>:<strength>:all' "
+        "over the ranking the server was started with (--neuron-steering-ranking); "
+        "applied at every token of this request. Unset: no neuron steering.",
+    )
+
     steering_name: str | None = Field(
         default=None,
         description="Name of a pre-registered steering module. "
@@ -408,6 +415,7 @@ class CompletionRequest(OpenAIBaseModel):
             decode_steering_vectors=unpack_steering_vectors(
                 self.decode_steering_vectors
             ),
+            neuron_steering=self.neuron_steering,
         )
         if self.capture is not None:
             sampling_params.capture = dict(self.capture)

@@ -48,6 +48,7 @@ from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
 from .speculative import EagleModelTypes, NgramGPUTypes, SpeculativeConfig
+from .neuron_steering import NeuronSteeringConfig
 from .steering import SteeringConfig
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
@@ -365,6 +366,9 @@ class VllmConfig:
     or programmatically via ``LLM(capture_consumers=...)``."""
     steering_config: SteeringConfig | None = None
     """Per-request activation steering configuration."""
+    neuron_steering_config: NeuronSteeringConfig | None = None
+    """Per-request neuron steering over a fixed ranking (``--neuron-steering-ranking``).
+    ``None`` means no neuron-steering buffers or ops anywhere in the model."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
     diffusion_config: DiffusionConfig | None = None
@@ -497,6 +501,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.steering_config:
             vllm_factors.append(self.steering_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.neuron_steering_config:
+            vllm_factors.append(self.neuron_steering_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.speculative_config:

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
@@ -93,6 +94,10 @@ class CachedRequestState:
 
 
 class InputBatch:
+    # Neuron-steering spec -> (k, percentile index, c); set by the GPU model
+    # runner at init when ``--neuron-steering-ranking`` is given.
+    nsteer_parse: Callable[[str], tuple[int, int, float]] | None = None
+
     def __init__(
         self,
         max_num_reqs: int,
@@ -259,6 +264,13 @@ class InputBatch:
         )
         # Tracks the union of both hashes (any non-zero hash gets tracked)
         self.steering_hash_to_request_ids: dict[int, set[str]] = {}
+
+        # Neuron steering: per-request preset row (0 = none). The class-level
+        # Per-request neuron steering: k (0 = none), percentile index, coefficient.
+        self.request_nsteer_k = np.zeros((self.max_num_reqs,), dtype=np.int64)
+        self.request_nsteer_q = np.zeros((self.max_num_reqs,), dtype=np.int64)
+        self.request_nsteer_c = np.zeros((self.max_num_reqs,), dtype=np.float32)
+        self.num_nsteer_reqs = 0
 
         # req_index -> generator
         # NOTE(woosuk): The indices of the requests that do not have their own
@@ -492,6 +504,19 @@ class InputBatch:
             # No LoRA
             self.request_lora_mapping[req_index] = 0
 
+        # Neuron steering spec (validated at admission).
+        nsteer_spec = (
+            request.sampling_params.neuron_steering if request.sampling_params else None
+        )
+        nk, nq, nc = (
+            self.nsteer_parse(nsteer_spec) if nsteer_spec and self.nsteer_parse else (0, 0, 0.0)
+        )
+        self.request_nsteer_k[req_index] = nk
+        self.request_nsteer_q[req_index] = nq
+        self.request_nsteer_c[req_index] = nc
+        if nk:
+            self.num_nsteer_reqs += 1
+
         # Steering config tracking (prefill and decode)
         prefill_hash = request.prefill_steering_config_hash
         decode_hash = request.decode_steering_config_hash
@@ -561,6 +586,12 @@ class InputBatch:
                 del self.lora_id_to_request_ids[lora_id]
                 del self.lora_id_to_lora_request[lora_id]
             self.request_lora_mapping[req_index] = 0
+
+        if self.request_nsteer_k[req_index]:
+            self.num_nsteer_reqs -= 1
+        self.request_nsteer_k[req_index] = 0
+        self.request_nsteer_q[req_index] = 0
+        self.request_nsteer_c[req_index] = 0.0
 
         # Steering cleanup (both prefill and decode hashes)
         for arr in (
@@ -682,6 +713,8 @@ class InputBatch:
             self.request_decode_steering_hash[i2],
             self.request_decode_steering_hash[i1],
         )
+        for arr in (self.request_nsteer_k, self.request_nsteer_q, self.request_nsteer_c):
+            arr[i1], arr[i2] = arr[i2], arr[i1]
 
         if self.is_pooling_model:
             # Sampling and logits parameters don't apply to pooling models.
@@ -817,6 +850,9 @@ class InputBatch:
             self.request_decode_steering_hash[empty_index] = (
                 self.request_decode_steering_hash[last_req_index]
             )
+            for arr in (self.request_nsteer_k, self.request_nsteer_q, self.request_nsteer_c):
+                arr[empty_index] = arr[last_req_index]
+                arr[last_req_index] = 0
 
             if self.is_pooling_model:
                 last_req_index -= 1
