@@ -269,7 +269,9 @@ def _filter_specs_to_layer_range(
                 kept_hooks[hook_name] = in_range
         if kept_hooks:
             mix = spec.mix
-            if mix is not None and not all(start <= m[0] < end for m in mix.members):
+            if mix is not None and not all(
+                start <= layer < end for group in mix.members for layer, _hook in group
+            ):
                 # A layer_mix needs every member on one stage (it sums them on
                 # this stage's GPU); under PP the request is refused upstream.
                 kept_hooks.pop("layer_mix", None)
@@ -295,24 +297,27 @@ _MIX_KEY: tuple[int, str] = (0, "layer_mix")
 class _MixPlan:
     """One step's ``layer_mix`` work (see :class:`vllm.v1.capture.types.LayerMix`).
 
-    ``idx`` are the batch rows to gather from each member hook (the same rows,
-    in the same scratch order, as the ``layer_mix`` entries); ``cols`` maps a
-    member ``(layer, hook)`` to its column in ``weights`` (``[rows, n]``
-    float32, one row per scratch row, so requests in one step may carry
-    different weights). ``acc`` is the running float32 sum; ``next`` is the
-    member expected next, which enforces the declared order.
+    ``idx`` are the batch rows to gather from each tap (the same rows, in the
+    same scratch order, as the ``layer_mix`` entries). ``taps`` maps each tap
+    ``(layer, hook)`` to ``(seq, group, last)``: its position in the flattened
+    firing order, its member group, and whether it closes that group.
+    ``weights`` is ``[rows, n_groups]`` float32, one row per scratch row, so
+    requests in one step may carry different weights. ``part`` is the open
+    group's running sum in the model dtype; ``acc`` the float32 total;
+    ``next`` the tap expected next, which enforces the declared order.
     """
 
     idx: torch.Tensor
-    cols: dict[tuple[int, str], int]
+    taps: dict[tuple[int, str], tuple[int, int, bool]]
     weights: torch.Tensor
+    part: torch.Tensor | None = None
     acc: torch.Tensor | None = None
     next: int = 0
     error: str | None = None
 
     @property
     def complete(self) -> bool:
-        return self.error is None and self.next == len(self.cols)
+        return self.error is None and self.next == len(self.taps)
 
 
 class CaptureManager:
@@ -934,9 +939,11 @@ class CaptureManager:
             return None
         weights = torch.tensor(per_row, dtype=torch.float32, device=self._device)
         scratch_dtype[_MIX_KEY] = torch.float32
-        return _MixPlan(
-            idx=idx, cols={m: i for i, m in enumerate(members)}, weights=weights
-        )
+        taps: dict[tuple[int, str], tuple[int, int, bool]] = {}
+        for g, group in enumerate(members):
+            for k, tap in enumerate(group):
+                taps[tap] = (len(taps), g, k == len(group) - 1)
+        return _MixPlan(idx=idx, taps=taps, weights=weights)
 
     def on_hook(
         self,
@@ -992,27 +999,34 @@ class CaptureManager:
     def _accumulate_mix(
         self, plan: StepCapturePlan, key: tuple[int, str], hidden_states: torch.Tensor
     ) -> None:
-        """Add one member's ``weight * layer_norm(h.float())`` to the step's mix.
+        """Add one tap to the step's ``layer_mix``.
 
-        Same ops, dtype and order as a consumer computing the sum from the
-        captured members (``F.layer_norm`` without affine, eps 1e-5, then
-        ``w0*hn0``, ``acc + w_i*hn_i``), so the result is identical to doing it
-        downstream on the same GPU -- only one float32 tensor leaves it.
+        A group's taps are added in the model dtype (``h_a + h_b``, as HF adds
+        the residual and the MLP branch); when the group closes, its
+        ``weight * layer_norm(r.float())`` joins the float32 total (``w0*ln0``,
+        then ``acc + w_g*ln_g``). Same ops, dtype and order as computing the
+        sum downstream from the captured taps on the same GPU, so the result
+        is identical -- only one float32 tensor leaves it.
         """
         mix = plan.mix
-        col = mix.cols.get(key)
-        if col is None or mix.error is not None:
+        slot = mix.taps.get(key)
+        if slot is None or mix.error is not None:
             return
-        if col != mix.next:
-            mix.error = (
-                f"layer_mix member {key} fired out of order (expected #{mix.next})"
-            )
+        seq, group, last = slot
+        if seq != mix.next:
+            mix.error = f"layer_mix tap {key} fired out of order (expected #{mix.next})"
             return
-        rows = hidden_states.index_select(0, mix.idx).float()
-        hn = torch.nn.functional.layer_norm(rows, rows.shape[-1:])
-        term = mix.weights[:, col : col + 1] * hn
-        mix.acc = term if mix.acc is None else mix.acc + term
+        rows = hidden_states.index_select(0, mix.idx)
+        mix.part = rows if mix.part is None else mix.part + rows
         mix.next += 1
+        if not last:
+            return
+        r = mix.part.float()
+        mix.part = None
+        term = mix.weights[:, group : group + 1] * torch.nn.functional.layer_norm(
+            r, r.shape[-1:]
+        )
+        mix.acc = term if mix.acc is None else mix.acc + term
         if mix.complete:
             plan.scratch_gpu[_MIX_KEY] = mix.acc
 
@@ -1076,7 +1090,7 @@ class CaptureManager:
             # A member never fired (or fired out of order): never emit a partial sum.
             reason = (
                 mix.error
-                or f"layer_mix incomplete ({mix.next}/{len(mix.cols)} members fired)"
+                or f"layer_mix incomplete ({mix.next}/{len(mix.taps)} taps fired)"
             )
             for e in plan.entries:
                 if (e.layer, e.hook) == _MIX_KEY:

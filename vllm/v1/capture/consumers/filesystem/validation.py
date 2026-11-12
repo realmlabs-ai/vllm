@@ -71,11 +71,11 @@ if TYPE_CHECKING:
 # only at ``layer_idx = num_hidden_layers - 1`` -- it taps the stack-final norm,
 # not a per-layer point. Requesting it at any other layer captures nothing.
 _VALID_HOOK_NAMES: frozenset[str] = frozenset(
-    ("pre_attn", "post_attn", "post_block", "post_norm", "layer_mix")
+    ("pre_attn", "post_attn", "post_block", "post_norm", "mlp_out", "layer_mix")
 )
 # Hooks a ``layer_mix`` member may name: real forward taps only.
 _MIX_MEMBER_HOOKS: frozenset[str] = frozenset(
-    ("pre_attn", "post_attn", "post_block", "post_norm")
+    ("pre_attn", "post_attn", "mlp_out", "post_block", "post_norm")
 )
 
 _VALID_POSITION_KINDS: frozenset[str] = frozenset(
@@ -526,8 +526,8 @@ def _validate_mix(
         raise CaptureValidationError(
             "capture.mix.weights must be a list with one weight per member"
         )
-    members: list[tuple[int, str]] = []
-    for m in members_raw:
+
+    def _tap(m: Any) -> tuple[int, str]:
         if (
             not isinstance(m, (list, tuple))
             or len(m) != 2
@@ -536,21 +536,39 @@ def _validate_mix(
             or m[1] not in _MIX_MEMBER_HOOKS
         ):
             raise CaptureValidationError(
-                f"capture.mix.members entries must be [layer, hook] with hook in "
+                f"capture.mix.members taps must be [layer, hook] with hook in "
                 f"{sorted(_MIX_MEMBER_HOOKS)}, got {m!r}"
             )
         if not 0 <= m[0] < num_hidden_layers:
             raise CaptureValidationError(
-                f"capture.mix.members layer {m[0]} out of range [0, {num_hidden_layers})"
+                f"capture.mix.members layer {m[0]} out of range "
+                f"[0, {num_hidden_layers})"
             )
-        members.append((int(m[0]), str(m[1])))
-    # Firing order within a decoder layer: pre_attn -> post_attn -> post_block
-    # -> post_norm (stack-final, last layer only).
-    order = {"pre_attn": 0, "post_attn": 1, "post_block": 2, "post_norm": 3}
-    ranks = [(layer, order[hook]) for layer, hook in members]
+        return (int(m[0]), str(m[1]))
+
+    # A member is one tap ``[layer, hook]`` or a group ``[[layer, hook], ...]``
+    # summed before normalizing.
+    members: list[tuple[tuple[int, str], ...]] = []
+    for m in members_raw:
+        is_group = (
+            isinstance(m, (list, tuple))
+            and len(m) > 0
+            and all(isinstance(x, (list, tuple)) for x in m)
+        )
+        members.append(tuple(_tap(x) for x in m) if is_group else (_tap(m),))
+    # Firing order within a decoder layer: pre_attn -> post_attn -> mlp_out ->
+    # post_block -> post_norm (stack-final, last layer only).
+    order = {
+        "pre_attn": 0,
+        "post_attn": 1,
+        "mlp_out": 2,
+        "post_block": 3,
+        "post_norm": 4,
+    }
+    ranks = [(layer, order[hook]) for group in members for layer, hook in group]
     if any(b <= a for a, b in zip(ranks, ranks[1:])):
         raise CaptureValidationError(
-            "capture.mix.members must be distinct and in forward firing order"
+            "capture.mix.members taps must be distinct and in forward firing order"
         )
     weights: list[float] = []
     for w in weights_raw:

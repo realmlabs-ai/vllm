@@ -80,17 +80,21 @@ CaptureKey = tuple[VllmInternalRequestId, int, str]
 class LayerMix:
     """A weighted sum of layer-normalized residuals, computed on the GPU.
 
-    ``out = sum_i weights[i] * layer_norm(h_i.float())`` over ``members`` in
-    order, where ``h_i`` is the residual at ``members[i] = (layer, hook)`` and
-    ``layer_norm`` has no affine parameters (eps 1e-5). The sum is accumulated
-    in float32 as the member hooks fire during the forward, so only one
-    ``[rows, hidden]`` float32 tensor leaves the GPU instead of one tensor per
-    member. Requested as the ``layer_mix`` hook at layer 0; members are
-    gathered at the same positions but are not emitted unless the spec also
-    lists them in ``hooks``. ``members`` must be in forward firing order.
+    ``out = sum_g weights[g] * layer_norm(r_g.float())`` over ``members`` in
+    order. Each member ``g`` is a group of one or more ``(layer, hook)`` taps
+    whose residuals are added in the model dtype *before* normalizing
+    (``r_g = h_a + h_b``): a decoder block whose output vLLM never
+    materializes (e.g. the final block, ``post_attn + mlp_out``) is rebuilt
+    exactly as HF computes it (bf16 add). ``layer_norm`` has no affine
+    parameters (eps 1e-5). The sum is accumulated in float32 as the taps fire
+    during the forward, so only one ``[rows, hidden]`` float32 tensor leaves
+    the GPU instead of one tensor per tap. Requested as the ``layer_mix`` hook
+    at layer 0; taps are gathered at the same positions but not emitted unless
+    the spec also lists them in ``hooks``. All taps, flattened across groups,
+    must be in forward firing order.
     """
 
-    members: tuple[tuple[int, str], ...]
+    members: tuple[tuple[tuple[int, str], ...], ...]
     weights: tuple[float, ...]
 
 
