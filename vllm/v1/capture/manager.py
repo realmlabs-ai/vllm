@@ -268,16 +268,51 @@ def _filter_specs_to_layer_range(
             if in_range:
                 kept_hooks[hook_name] = in_range
         if kept_hooks:
-            filtered[consumer_idx] = CaptureSpec(
-                hooks=kept_hooks,
-                positions=spec.positions,
-            )
+            mix = spec.mix
+            if mix is not None and not all(start <= m[0] < end for m in mix.members):
+                # A layer_mix needs every member on one stage (it sums them on
+                # this stage's GPU); under PP the request is refused upstream.
+                kept_hooks.pop("layer_mix", None)
+                mix = None
+            if kept_hooks:
+                filtered[consumer_idx] = CaptureSpec(
+                    hooks=kept_hooks,
+                    positions=spec.positions,
+                    mix=mix,
+                )
     return filtered
 
 
 # ---------------------------------------------------------------------------
 # Capture manager
 # ---------------------------------------------------------------------------
+
+
+_MIX_KEY: tuple[int, str] = (0, "layer_mix")
+
+
+@dataclass
+class _MixPlan:
+    """One step's ``layer_mix`` work (see :class:`vllm.v1.capture.types.LayerMix`).
+
+    ``idx`` are the batch rows to gather from each member hook (the same rows,
+    in the same scratch order, as the ``layer_mix`` entries); ``cols`` maps a
+    member ``(layer, hook)`` to its column in ``weights`` (``[rows, n]``
+    float32, one row per scratch row, so requests in one step may carry
+    different weights). ``acc`` is the running float32 sum; ``next`` is the
+    member expected next, which enforces the declared order.
+    """
+
+    idx: torch.Tensor
+    cols: dict[tuple[int, str], int]
+    weights: torch.Tensor
+    acc: torch.Tensor | None = None
+    next: int = 0
+    error: str | None = None
+
+    @property
+    def complete(self) -> bool:
+        return self.error is None and self.next == len(self.cols)
 
 
 class CaptureManager:
@@ -792,12 +827,15 @@ class CaptureManager:
             else:
                 gather_indices[key] = idx
 
+        mix_plan = self._build_mix_plan(gather_indices, scratch_dtype, entries, request_errors)
+
         plan = StepCapturePlan(
             gather_indices=gather_indices,
             scratch_gpu=scratch_gpu,
             scratch_dtype=scratch_dtype,
             entries=entries,
             global_gather_indices=global_gather_indices,
+            mix=mix_plan,
             request_errors=request_errors,
         )
         self._step_plan = plan
@@ -835,7 +873,62 @@ class CaptureManager:
         keep full cudagraph speed).
         """
         plan = self._step_plan
-        return plan is not None and bool(plan.gather_indices)
+        return plan is not None and (bool(plan.gather_indices) or plan.mix is not None)
+
+    def _build_mix_plan(
+        self,
+        gather_indices: dict[tuple[int, str], torch.Tensor],
+        scratch_dtype: dict[tuple[int, str], torch.dtype],
+        entries: list[CapturePositionEntry],
+        request_errors: dict[str, str],
+    ) -> _MixPlan | None:
+        """Turn this step's ``layer_mix`` rows into a :class:`_MixPlan`.
+
+        The ``layer_mix`` key is removed from ``gather_indices`` (no forward
+        hook fires for it; :meth:`on_hook` fills it from its members). Every
+        request mixing in one step must name the same members; a request that
+        disagrees is failed rather than mixed with someone else's layers.
+        """
+        idx = gather_indices.pop(_MIX_KEY, None)
+        if idx is None:
+            return None
+        rows = [e for e in entries if (e.layer, e.hook) == _MIX_KEY]
+        rows.sort(key=lambda e: e.scratch_row)
+        members: tuple[tuple[int, str], ...] | None = None
+        per_row: list[tuple[float, ...]] = []
+        bad: set[str] = set()
+        for e in rows:
+            state = self._requests.get(e.request_id)
+            mix = None
+            if state is not None:
+                for consumer_idx, spec in state.consumer_specs.items():
+                    if e.consumer_mask & (1 << consumer_idx) and spec.mix is not None:
+                        mix = spec.mix
+                        break
+            if mix is None:
+                bad.add(e.request_id)
+                per_row.append(())
+                continue
+            if members is None:
+                members = mix.members
+            elif mix.members != members:
+                bad.add(e.request_id)
+            per_row.append(mix.weights)
+        for rid in bad:
+            msg = "layer_mix: members differ from another request in the same step"
+            request_errors.setdefault(rid, msg)
+            self.record_request_error(rid, msg)
+        if members is None or bad:
+            # Fail the step's mix as a whole: rows are interleaved by request, so a
+            # partial plan would need per-request index tensors. Simple and rare.
+            for e in rows:
+                request_errors.setdefault(e.request_id, "layer_mix could not be planned")
+                self.record_request_error(e.request_id, "layer_mix could not be planned")
+            entries[:] = [e for e in entries if (e.layer, e.hook) != _MIX_KEY]
+            return None
+        weights = torch.tensor(per_row, dtype=torch.float32, device=self._device)
+        scratch_dtype[_MIX_KEY] = torch.float32
+        return _MixPlan(idx=idx, cols={m: i for i, m in enumerate(members)}, weights=weights)
 
     def on_hook(
         self,
@@ -877,6 +970,8 @@ class CaptureManager:
         plan = self._step_plan
         if plan is None:
             return
+        if plan.mix is not None:
+            self._accumulate_mix(plan, key, hidden_states)
         idx = plan.gather_indices.get(key)
         if idx is None:
             return
@@ -885,6 +980,30 @@ class CaptureManager:
         if gathered.dtype != target_dtype:
             gathered = gathered.to(target_dtype)
         plan.scratch_gpu[key] = gathered
+
+    def _accumulate_mix(self, plan: StepCapturePlan, key: tuple[int, str],
+                        hidden_states: torch.Tensor) -> None:
+        """Add one member's ``weight * layer_norm(h.float())`` to the step's mix.
+
+        Same ops, dtype and order as a consumer computing the sum from the
+        captured members (``F.layer_norm`` without affine, eps 1e-5, then
+        ``w0*hn0``, ``acc + w_i*hn_i``), so the result is identical to doing it
+        downstream on the same GPU -- only one float32 tensor leaves it.
+        """
+        mix = plan.mix
+        col = mix.cols.get(key)
+        if col is None or mix.error is not None:
+            return
+        if col != mix.next:
+            mix.error = f"layer_mix member {key} fired out of order (expected #{mix.next})"
+            return
+        rows = hidden_states.index_select(0, mix.idx).float()
+        hn = torch.nn.functional.layer_norm(rows, rows.shape[-1:])
+        term = mix.weights[:, col:col + 1] * hn
+        mix.acc = term if mix.acc is None else mix.acc + term
+        mix.next += 1
+        if mix.complete:
+            plan.scratch_gpu[_MIX_KEY] = mix.acc
 
     # ----------------------------------------------------- dispatch
 
@@ -940,6 +1059,16 @@ class CaptureManager:
         # ``scratch_gpu`` first, so the rest of this method treats global
         # and client keys uniformly. No-op when no global key captured.
         self._materialize_global_keys(plan)
+
+        mix = plan.mix
+        if mix is not None and not mix.complete:
+            # A member never fired (or fired out of order): never emit a partial sum.
+            reason = mix.error or f"layer_mix incomplete ({mix.next}/{len(mix.cols)} members fired)"
+            for e in plan.entries:
+                if (e.layer, e.hook) == _MIX_KEY:
+                    self.record_request_error(e.request_id, reason)
+            plan.entries = [e for e in plan.entries if (e.layer, e.hook) != _MIX_KEY]
+            plan.scratch_gpu.pop(_MIX_KEY, None)
 
         if not plan.entries:
             return
@@ -1320,6 +1449,10 @@ class CaptureManager:
             return
         seen: set[tuple[str, int, str, int]] = set()
         for entry in packet.entries:
+            if entry.hook == "layer_mix":
+                # Depends on the request's weights, not only on the prefix: never
+                # store it (so a request asking for it is never served from the store).
+                continue
             pos = entry.logical_pos
             dedup = (entry.request_id, entry.layer, entry.hook, pos)
             if dedup in seen:

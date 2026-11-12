@@ -41,6 +41,7 @@ from vllm.v1.capture.types import (
     CaptureContext,
     CaptureSpec,
     HookName,
+    LayerMix,
     PositionSelector,
 )
 
@@ -70,6 +71,10 @@ if TYPE_CHECKING:
 # only at ``layer_idx = num_hidden_layers - 1`` -- it taps the stack-final norm,
 # not a per-layer point. Requesting it at any other layer captures nothing.
 _VALID_HOOK_NAMES: frozenset[str] = frozenset(
+    ("pre_attn", "post_attn", "post_block", "post_norm", "layer_mix")
+)
+# Hooks a ``layer_mix`` member may name: real forward taps only.
+_MIX_MEMBER_HOOKS: frozenset[str] = frozenset(
     ("pre_attn", "post_attn", "post_block", "post_norm")
 )
 
@@ -461,7 +466,8 @@ def validate_filesystem_request(
                 f"for this request is {ctx.num_computed_tokens}."
             )
 
-    return CaptureSpec(hooks=resolved_hooks, positions=resolved_positions)
+    mix = _validate_mix(raw, resolved_hooks, ctx.num_hidden_layers)
+    return CaptureSpec(hooks=resolved_hooks, positions=resolved_positions, mix=mix)
 
 
 def slug_path_components(raw: FilesystemCaptureRequest) -> tuple[str, str]:
@@ -479,3 +485,72 @@ def slug_path_components(raw: FilesystemCaptureRequest) -> tuple[str, str]:
 
 
 __all__: list[str] = ["validate_filesystem_request", "slug_path_components"]
+
+
+def _validate_mix(
+    raw: FilesystemCaptureRequest,
+    resolved_hooks: dict[HookName, list[int]],
+    num_hidden_layers: int,
+) -> LayerMix | None:
+    """Validate the optional ``layer_mix`` spec; ``None`` when not requested.
+
+    ``hooks["layer_mix"]`` and ``mix`` must come together; ``layer_mix`` is only
+    ever layer 0; members are real hooks at in-range layers, in strictly
+    increasing firing order, without repeats; weights are finite and one per
+    member; the only norm is ``layer_norm`` (no affine, eps 1e-5).
+    """
+    import math
+
+    mix = getattr(raw, "mix", None)
+    want = "layer_mix" in resolved_hooks
+    if mix is None and not want:
+        return None
+    if mix is None or not want:
+        raise CaptureValidationError(
+            "capture.mix and capture.hooks['layer_mix'] must be given together"
+        )
+    if resolved_hooks["layer_mix"] != [0]:
+        raise CaptureValidationError("capture.hooks['layer_mix'] must be [0]")
+    if not isinstance(mix, dict):
+        raise CaptureValidationError("capture.mix must be an object")
+    unknown = set(mix) - {"members", "weights", "norm"}
+    if unknown:
+        raise CaptureValidationError(f"capture.mix has unknown keys {sorted(unknown)}")
+    if mix.get("norm", "layer_norm") != "layer_norm":
+        raise CaptureValidationError("capture.mix.norm must be 'layer_norm'")
+    members_raw = mix.get("members")
+    weights_raw = mix.get("weights")
+    if not isinstance(members_raw, list) or not members_raw:
+        raise CaptureValidationError("capture.mix.members must be a non-empty list")
+    if not isinstance(weights_raw, list) or len(weights_raw) != len(members_raw):
+        raise CaptureValidationError(
+            "capture.mix.weights must be a list with one weight per member"
+        )
+    members: list[tuple[int, str]] = []
+    for m in members_raw:
+        if (not isinstance(m, (list, tuple)) or len(m) != 2
+                or not isinstance(m[0], int) or isinstance(m[0], bool)
+                or m[1] not in _MIX_MEMBER_HOOKS):
+            raise CaptureValidationError(
+                f"capture.mix.members entries must be [layer, hook] with hook in "
+                f"{sorted(_MIX_MEMBER_HOOKS)}, got {m!r}"
+            )
+        if not 0 <= m[0] < num_hidden_layers:
+            raise CaptureValidationError(
+                f"capture.mix.members layer {m[0]} out of range [0, {num_hidden_layers})"
+            )
+        members.append((int(m[0]), str(m[1])))
+    # Firing order within a decoder layer: pre_attn -> post_attn -> post_block
+    # -> post_norm (stack-final, last layer only).
+    order = {"pre_attn": 0, "post_attn": 1, "post_block": 2, "post_norm": 3}
+    ranks = [(layer, order[hook]) for layer, hook in members]
+    if any(b <= a for a, b in zip(ranks, ranks[1:])):
+        raise CaptureValidationError(
+            "capture.mix.members must be distinct and in forward firing order"
+        )
+    weights: list[float] = []
+    for w in weights_raw:
+        if isinstance(w, bool) or not isinstance(w, (int, float)) or not math.isfinite(w):
+            raise CaptureValidationError(f"capture.mix.weights must be finite numbers, got {w!r}")
+        weights.append(float(w))
+    return LayerMix(members=tuple(members), weights=tuple(weights))

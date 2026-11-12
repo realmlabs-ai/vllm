@@ -51,6 +51,11 @@ HookName = Literal[
     # Stack-final norm output, fired at layer ``num_hidden_layers - 1``:
     # post-final-RMSNorm == HF's last ``hidden_states`` entry.
     "post_norm",
+    # Not a forward tap: the per-request weighted layer-norm sum described by
+    # ``CaptureSpec.mix`` (see :class:`LayerMix`), always at layer 0. It is
+    # filled in ``CaptureManager.on_hook`` from its member hooks and never
+    # fires on its own.
+    "layer_mix",
 ]
 
 PositionSelector = (
@@ -72,6 +77,24 @@ CaptureKey = tuple[VllmInternalRequestId, int, str]
 
 
 @dataclass(frozen=True)
+class LayerMix:
+    """A weighted sum of layer-normalized residuals, computed on the GPU.
+
+    ``out = sum_i weights[i] * layer_norm(h_i.float())`` over ``members`` in
+    order, where ``h_i`` is the residual at ``members[i] = (layer, hook)`` and
+    ``layer_norm`` has no affine parameters (eps 1e-5). The sum is accumulated
+    in float32 as the member hooks fire during the forward, so only one
+    ``[rows, hidden]`` float32 tensor leaves the GPU instead of one tensor per
+    member. Requested as the ``layer_mix`` hook at layer 0; members are
+    gathered at the same positions but are not emitted unless the spec also
+    lists them in ``hooks``. ``members`` must be in forward firing order.
+    """
+
+    members: tuple[tuple[int, str], ...]
+    weights: tuple[float, ...]
+
+
+@dataclass(frozen=True)
 class CaptureSpec:
     """Describes which activations to capture for a request.
 
@@ -88,6 +111,7 @@ class CaptureSpec:
 
     hooks: dict[HookName, list[int]]
     positions: PositionSelector
+    mix: LayerMix | None = None
 
 
 def min_captured_prompt_position(
