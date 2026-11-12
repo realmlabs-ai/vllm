@@ -827,7 +827,9 @@ class CaptureManager:
             else:
                 gather_indices[key] = idx
 
-        mix_plan = self._build_mix_plan(gather_indices, scratch_dtype, entries, request_errors)
+        mix_plan = self._build_mix_plan(
+            gather_indices, scratch_dtype, entries, request_errors
+        )
 
         plan = StepCapturePlan(
             gather_indices=gather_indices,
@@ -922,13 +924,19 @@ class CaptureManager:
             # Fail the step's mix as a whole: rows are interleaved by request, so a
             # partial plan would need per-request index tensors. Simple and rare.
             for e in rows:
-                request_errors.setdefault(e.request_id, "layer_mix could not be planned")
-                self.record_request_error(e.request_id, "layer_mix could not be planned")
+                request_errors.setdefault(
+                    e.request_id, "layer_mix could not be planned"
+                )
+                self.record_request_error(
+                    e.request_id, "layer_mix could not be planned"
+                )
             entries[:] = [e for e in entries if (e.layer, e.hook) != _MIX_KEY]
             return None
         weights = torch.tensor(per_row, dtype=torch.float32, device=self._device)
         scratch_dtype[_MIX_KEY] = torch.float32
-        return _MixPlan(idx=idx, cols={m: i for i, m in enumerate(members)}, weights=weights)
+        return _MixPlan(
+            idx=idx, cols={m: i for i, m in enumerate(members)}, weights=weights
+        )
 
     def on_hook(
         self,
@@ -981,8 +989,9 @@ class CaptureManager:
             gathered = gathered.to(target_dtype)
         plan.scratch_gpu[key] = gathered
 
-    def _accumulate_mix(self, plan: StepCapturePlan, key: tuple[int, str],
-                        hidden_states: torch.Tensor) -> None:
+    def _accumulate_mix(
+        self, plan: StepCapturePlan, key: tuple[int, str], hidden_states: torch.Tensor
+    ) -> None:
         """Add one member's ``weight * layer_norm(h.float())`` to the step's mix.
 
         Same ops, dtype and order as a consumer computing the sum from the
@@ -995,11 +1004,13 @@ class CaptureManager:
         if col is None or mix.error is not None:
             return
         if col != mix.next:
-            mix.error = f"layer_mix member {key} fired out of order (expected #{mix.next})"
+            mix.error = (
+                f"layer_mix member {key} fired out of order (expected #{mix.next})"
+            )
             return
         rows = hidden_states.index_select(0, mix.idx).float()
         hn = torch.nn.functional.layer_norm(rows, rows.shape[-1:])
-        term = mix.weights[:, col:col + 1] * hn
+        term = mix.weights[:, col : col + 1] * hn
         mix.acc = term if mix.acc is None else mix.acc + term
         mix.next += 1
         if mix.complete:
@@ -1063,7 +1074,10 @@ class CaptureManager:
         mix = plan.mix
         if mix is not None and not mix.complete:
             # A member never fired (or fired out of order): never emit a partial sum.
-            reason = mix.error or f"layer_mix incomplete ({mix.next}/{len(mix.cols)} members fired)"
+            reason = (
+                mix.error
+                or f"layer_mix incomplete ({mix.next}/{len(mix.cols)} members fired)"
+            )
             for e in plan.entries:
                 if (e.layer, e.hook) == _MIX_KEY:
                     self.record_request_error(e.request_id, reason)

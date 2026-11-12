@@ -528,9 +528,13 @@ def _validate_mix(
         )
     members: list[tuple[int, str]] = []
     for m in members_raw:
-        if (not isinstance(m, (list, tuple)) or len(m) != 2
-                or not isinstance(m[0], int) or isinstance(m[0], bool)
-                or m[1] not in _MIX_MEMBER_HOOKS):
+        if (
+            not isinstance(m, (list, tuple))
+            or len(m) != 2
+            or not isinstance(m[0], int)
+            or isinstance(m[0], bool)
+            or m[1] not in _MIX_MEMBER_HOOKS
+        ):
             raise CaptureValidationError(
                 f"capture.mix.members entries must be [layer, hook] with hook in "
                 f"{sorted(_MIX_MEMBER_HOOKS)}, got {m!r}"
@@ -550,7 +554,13 @@ def _validate_mix(
         )
     weights: list[float] = []
     for w in weights_raw:
-        if isinstance(w, bool) or not isinstance(w, (int, float)) or not math.isfinite(w):
-            raise CaptureValidationError(f"capture.mix.weights must be finite numbers, got {w!r}")
+        if (
+            isinstance(w, bool)
+            or not isinstance(w, (int, float))
+            or not math.isfinite(w)
+        ):
+            raise CaptureValidationError(
+                f"capture.mix.weights must be finite numbers, got {w!r}"
+            )
         weights.append(float(w))
     return LayerMix(members=tuple(members), weights=tuple(weights))
