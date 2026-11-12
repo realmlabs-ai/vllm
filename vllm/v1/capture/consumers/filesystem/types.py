@@ -36,6 +36,10 @@ class FilesystemCaptureRequest:
     #                (end-of-run / bulk reader model).
     # ``None`` defers to the consumer-level ``default_layout``.
     layout: str | None = None
+    # Optional ``layer_mix`` spec (with ``hooks["layer_mix"] == [0]``):
+    # ``{"members": [[layer, hook], ...], "weights": [float, ...],
+    # "norm": "layer_norm"}``. See :class:`vllm.v1.capture.types.LayerMix`.
+    mix: dict[str, Any] | None = None
 
 
 @dataclass

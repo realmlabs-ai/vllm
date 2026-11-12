@@ -16,6 +16,7 @@ code can depend on them without pulling in the manager's implementation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 
@@ -123,6 +124,8 @@ class StepCapturePlan:
         default_factory=dict
     )
     request_errors: dict[str, str] = field(default_factory=dict)
+    # ``layer_mix`` state for this step (``CaptureManager._MixPlan``), or None.
+    mix: Any = None
 
 
 __all__ = [
